@@ -393,35 +393,29 @@ def session_search(
 
         summaries = []
         for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
-            when_str = _format_timestamp(match_info.get("session_started"))
-            source_str = match_info.get("source", "unknown")
-            model_str = match_info.get("model")
-            
-            if isinstance(result, Exception) or not result:
+            if isinstance(result, Exception):
                 logging.warning(
-                    "Summarization failed or returned empty for session %s. Using raw fallback preview.",
-                    session_id,
-                    exc_info=isinstance(result, Exception)
+                    "Failed to summarize session %s: %s",
+                    session_id, result, exc_info=True,
                 )
-                # Fallback: Instead of dropping the result completely (which causes false negatives),
-                # return a raw preview from the conversation text.
-                preview_text = conversation_text[:500] + "\n...[truncated]" if conversation_text else "No preview available."
-                
-                summaries.append({
-                    "session_id": session_id,
-                    "when": when_str,
-                    "source": source_str,
-                    "model": model_str,
-                    "summary": f"[Summarization Failed] Raw match preview:\n{preview_text}",
-                })
+                result = None
+
+            entry = {
+                "session_id": session_id,
+                "when": _format_timestamp(match_info.get("session_started")),
+                "source": match_info.get("source", "unknown"),
+                "model": match_info.get("model"),
+            }
+
+            if result:
+                entry["summary"] = result
             else:
-                summaries.append({
-                    "session_id": session_id,
-                    "when": when_str,
-                    "source": source_str,
-                    "model": model_str,
-                    "summary": result,
-                })
+                # Fallback: raw preview so matched sessions aren't silently
+                # dropped when the summarizer is unavailable (fixes #3409).
+                preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+                entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
+
+            summaries.append(entry)
 
         return json.dumps({
             "success": True,
