@@ -788,6 +788,7 @@ class GatewayRunner:
             "api_mode": runtime_kwargs.get("api_mode"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
+            "credential_pool": runtime_kwargs.get("credential_pool"),
         }
         return resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
 
@@ -1881,6 +1882,9 @@ class GatewayRunner:
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
+
+        if canonical == "self-improve":
+            return await self._handle_self_improve_command(event)
 
         if canonical == "status":
             return await self._handle_status_command(event)
@@ -3045,6 +3049,7 @@ class GatewayRunner:
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""
         from hermes_constants import get_hermes_home, display_hermes_home
+        from hermes_cli.self_improve import profile_fork_summary_lines
         from pathlib import Path
 
         home = get_hermes_home()
@@ -3059,18 +3064,20 @@ class GatewayRunner:
         except ValueError:
             profile_name = None
 
-        if profile_name:
-            lines = [
-                f"👤 **Profile:** `{profile_name}`",
-                f"📂 **Home:** `{display}`",
-            ]
-        else:
-            lines = [
-                "👤 **Profile:** default",
-                f"📂 **Home:** `{display}`",
-            ]
+        resolved_profile = profile_name or "default"
+        lines = [
+            f"👤 **Profile:** `{resolved_profile}`",
+            f"📂 **Home:** `{display}`",
+        ]
+        lines.extend(profile_fork_summary_lines(resolved_profile, markdown=True))
 
         return "\n".join(lines)
+
+    async def _handle_self_improve_command(self, event: MessageEvent) -> str:
+        """Handle /self-improve — manage profile-scoped Hermes fork workflows."""
+        from hermes_cli.self_improve import handle_self_improve_command
+
+        return handle_self_improve_command(event.text or "/self-improve", markdown=True)
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""

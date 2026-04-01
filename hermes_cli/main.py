@@ -75,64 +75,143 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Profile override — MUST happen before any hermes module import.
 #
 # Many modules cache HERMES_HOME at import time (module-level constants).
-# We intercept --profile/-p from sys.argv here and set the env var so that
-# every subsequent ``os.getenv("HERMES_HOME", ...)`` resolves correctly.
-# The flag is stripped from sys.argv so argparse never sees it.
-# Falls back to ~/.hermes/active_profile for sticky default.
+# We intercept profile selection here and set the env var so every subsequent
+# import resolves the correct profile home. When that profile has an attached
+# self-improve worktree, we also re-exec from that worktree's source tree so
+# the runtime actually matches the profile-owned fork.
 # ---------------------------------------------------------------------------
-def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before module imports."""
-    argv = sys.argv[1:]
-    profile_name = None
-    consume = 0
+_PROFILE_SOURCE_ROOT_ENV = "HERMES_PROFILE_SOURCE_ROOT"
+_PROFILE_SOURCE_REEXEC_GUARD_ENV = "HERMES_PROFILE_SOURCE_REEXEC_GUARD"
 
-    # 1. Check for explicit -p / --profile flag
+
+def _should_skip_profile_source_reexec() -> bool:
+    argv0 = Path(sys.argv[0]).name.lower() if sys.argv else ""
+    if argv0 in {"pytest", "py.test"}:
+        return True
+    return os.environ.get("HERMES_SKIP_PROFILE_SOURCE_REEXEC") == "1"
+
+
+def _prepend_pythonpath(source_root: Path, existing: Optional[str]) -> str:
+    parts = [str(source_root)]
+    if existing:
+        parts.append(existing)
+    return os.pathsep.join(parts)
+
+
+def _discover_explicit_profile(argv: list[str]) -> tuple[Optional[str], int]:
     for i, arg in enumerate(argv):
         if arg in ("--profile", "-p") and i + 1 < len(argv):
-            profile_name = argv[i + 1]
-            consume = 2
-            break
-        elif arg.startswith("--profile="):
-            profile_name = arg.split("=", 1)[1]
-            consume = 1
-            break
+            return argv[i + 1], 2
+        if arg.startswith("--profile="):
+            return arg.split("=", 1)[1], 1
+    return None, 0
 
-    # 2. If no flag, check ~/.hermes/active_profile
-    if profile_name is None:
+
+def _discover_profile_from_env_or_active() -> Optional[str]:
+    try:
+        from hermes_cli.profiles import infer_profile_name_from_home_path
+
+        env_profile = infer_profile_name_from_home_path(os.environ.get("HERMES_HOME"))
+        if env_profile not in {"default", "custom"}:
+            return env_profile
+    except Exception:
+        pass
+
+    try:
+        active_path = Path.home() / ".hermes" / "active_profile"
+        if active_path.exists():
+            name = active_path.read_text().strip()
+            if name and name != "default":
+                return name
+    except (UnicodeDecodeError, OSError):
+        pass
+
+    return None
+
+
+def _maybe_reexec_attached_profile_source(profile_name: Optional[str]) -> None:
+    if not profile_name or profile_name in {"default", "custom"}:
+        return
+    if _should_skip_profile_source_reexec():
+        return
+
+    try:
+        from hermes_cli.self_improve import resolve_profile_attached_runtime_root
+
+        target_root = resolve_profile_attached_runtime_root(profile_name)
+    except Exception as exc:
+        print(
+            f"Warning: attached profile source detection failed ({exc}), continuing with current source",
+            file=sys.stderr,
+        )
+        return
+
+    if not target_root:
+        return
+
+    current_root = PROJECT_ROOT.resolve()
+    target_root = target_root.resolve()
+
+    if current_root == target_root:
+        os.environ[_PROFILE_SOURCE_ROOT_ENV] = str(target_root)
+        os.environ.pop(_PROFILE_SOURCE_REEXEC_GUARD_ENV, None)
+        return
+
+    attempted_root = os.environ.get(_PROFILE_SOURCE_REEXEC_GUARD_ENV)
+    if attempted_root:
         try:
-            active_path = Path.home() / ".hermes" / "active_profile"
-            if active_path.exists():
-                name = active_path.read_text().strip()
-                if name and name != "default":
-                    profile_name = name
-                    consume = 0  # don't strip anything from argv
-        except (UnicodeDecodeError, OSError):
-            pass  # corrupted file, skip
+            if Path(attempted_root).expanduser().resolve() == target_root:
+                print(
+                    "Warning: attached profile worktree re-exec did not switch the source root; continuing with current source.",
+                    file=sys.stderr,
+                )
+                return
+        except OSError:
+            pass
 
-    # 3. If we found a profile, resolve and set HERMES_HOME
+    env = dict(os.environ)
+    env[_PROFILE_SOURCE_ROOT_ENV] = str(target_root)
+    env[_PROFILE_SOURCE_REEXEC_GUARD_ENV] = str(target_root)
+    env["PYTHONPATH"] = _prepend_pythonpath(target_root, env.get("PYTHONPATH"))
+    target_entry = target_root / "hermes_cli" / "main.py"
+    os.execvpe(sys.executable, [sys.executable, str(target_entry), *sys.argv[1:]], env)
+
+
+def _apply_profile_override() -> None:
+    """Pre-parse profile selection, set HERMES_HOME, and re-exec from an attached worktree if needed."""
+    argv = sys.argv[1:]
+    profile_name, consume = _discover_explicit_profile(argv)
+
+    if profile_name is None:
+        profile_name = _discover_profile_from_env_or_active()
+
     if profile_name is not None:
         try:
             from hermes_cli.profiles import resolve_profile_env
+
             hermes_home = resolve_profile_env(profile_name)
         except (ValueError, FileNotFoundError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
         except Exception as exc:
-            # A bug in profiles.py must NEVER prevent hermes from starting
             print(f"Warning: profile override failed ({exc}), using default", file=sys.stderr)
             return
+
         os.environ["HERMES_HOME"] = hermes_home
-        # Strip the flag from argv so argparse doesn't choke
+
         if consume > 0:
             for i, arg in enumerate(argv):
                 if arg in ("--profile", "-p"):
-                    start = i + 1  # +1 because argv is sys.argv[1:]
+                    start = i + 1
                     sys.argv = sys.argv[:start] + sys.argv[start + consume:]
                     break
-                elif arg.startswith("--profile="):
+                if arg.startswith("--profile="):
                     start = i + 1
                     sys.argv = sys.argv[:start] + sys.argv[start + 1:]
                     break
+
+        _maybe_reexec_attached_profile_source(profile_name)
+
 
 _apply_profile_override()
 
@@ -3439,6 +3518,12 @@ def cmd_profile(args):
                 if p.alias_path:
                     print(f"Alias:          {p.name} → hermes -p {p.name}")
                 break
+        try:
+            from hermes_cli.self_improve import profile_fork_summary_lines
+            for line in profile_fork_summary_lines(profile_name):
+                print(line)
+        except Exception:
+            pass
         print()
         return
 
@@ -3482,6 +3567,8 @@ def cmd_profile(args):
         clone = getattr(args, "clone", False)
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
+        fork_current_repo = getattr(args, "fork_current_repo", False)
+        fork_base = getattr(args, "fork_base", "HEAD")
 
         try:
             clone_from = getattr(args, "clone_from", None)
@@ -3527,11 +3614,25 @@ def cmd_profile(args):
                             print(f'  Add to your shell config (~/.bashrc or ~/.zshrc):')
                             print(f'    export PATH="$HOME/.local/bin:$PATH"')
 
+            if fork_current_repo:
+                from hermes_cli.self_improve import initialize_profile_fork
+
+                fork_result = initialize_profile_fork(name, base_ref=fork_base)
+                print(f"Attached Hermes fork: {fork_result['worktree_path']}")
+                print(f"Fork branch:          {fork_result['profile_branch']}")
+                health = fork_result.get("healthcheck", {})
+                if health.get("ok"):
+                    print(f"Healthcheck:          passed @ {health.get('current_ref_short')}")
+                else:
+                    print("Healthcheck:          failed")
+
             # Next steps
             print(f"\nNext steps:")
             print(f"  {name} setup              Configure API keys and model")
             print(f"  {name} chat               Start chatting")
             print(f"  {name} gateway start      Start the messaging gateway")
+            if fork_current_repo:
+                print(f"  {name} chat               Then run /self-improve status")
             if clone or clone_all:
                 from hermes_constants import get_hermes_home
                 profile_dir_display = f"~/.hermes/profiles/{name}"
@@ -3539,7 +3640,7 @@ def cmd_profile(args):
                 print(f"  Edit {profile_dir_display}/SOUL.md for different personality")
             print()
 
-        except (ValueError, FileExistsError, FileNotFoundError) as e:
+        except (ValueError, FileExistsError, FileNotFoundError, RuntimeError) as e:
             print(f"Error: {e}")
             sys.exit(1)
 
@@ -3574,6 +3675,12 @@ def cmd_profile(args):
         print(f"SOUL.md: {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}")
         if wrapper.exists():
             print(f"Alias:   {wrapper}")
+        try:
+            from hermes_cli.self_improve import profile_fork_summary_lines
+            for line in profile_fork_summary_lines(name):
+                print(line)
+        except Exception:
+            pass
         print()
 
     elif action == "alias":
@@ -4949,6 +5056,10 @@ For more help on a command:
                                 help="Source profile to clone from (default: active)")
     profile_create.add_argument("--no-alias", action="store_true",
                                 help="Skip wrapper script creation")
+    profile_create.add_argument("--fork-current-repo", action="store_true",
+                                help="Attach the current Hermes git repo as a profile-scoped worktree")
+    profile_create.add_argument("--fork-base", default="HEAD",
+                                help="Base ref for the profile worktree branch (default: HEAD)")
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")

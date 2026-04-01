@@ -2024,6 +2024,7 @@ class HermesCLI:
                 "api_mode": self.api_mode,
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
+                "credential_pool": getattr(self, "_credential_pool", None),
             },
         )
 
@@ -2872,6 +2873,7 @@ class HermesCLI:
     def _handle_profile_command(self):
         """Display active profile name and home directory."""
         from hermes_constants import get_hermes_home, display_hermes_home
+        from hermes_cli.self_improve import profile_fork_summary_lines
 
         home = get_hermes_home()
         display = display_hermes_home()
@@ -2883,12 +2885,20 @@ class HermesCLI:
         except ValueError:
             profile_name = None
 
+        resolved_profile = profile_name or "default"
         print()
-        if profile_name:
-            print(f"  Profile: {profile_name}")
-        else:
-            print("  Profile: default")
+        print(f"  Profile: {resolved_profile}")
         print(f"  Home:    {display}")
+        for line in profile_fork_summary_lines(resolved_profile):
+            print(f"  {line}")
+        print()
+
+    def _handle_self_improve_command(self, cmd: str):
+        """Handle /self-improve — manage profile-scoped Hermes fork workflows."""
+        from hermes_cli.self_improve import handle_self_improve_command
+
+        print()
+        print(handle_self_improve_command(cmd))
         print()
 
     def show_config(self):
@@ -3909,6 +3919,8 @@ class HermesCLI:
                 self._reload_mcp()
         elif canonical == "browser":
             self._handle_browser_command(cmd_original)
+        elif canonical == "self-improve":
+            self._handle_self_improve_command(cmd_original)
         elif canonical == "plugins":
             try:
                 from hermes_cli.plugins import get_plugin_manager
