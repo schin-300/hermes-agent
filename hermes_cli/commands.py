@@ -121,9 +121,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
-    CommandDef("self-improve", "Manage a profile-scoped Hermes fork/worktree and health rollback",
-               "Tools & Skills", args_hint="[status|init|branch|check|rollback|submit]",
-               subcommands=("status", "init", "branch", "check", "rollback", "submit")),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

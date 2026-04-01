@@ -509,23 +509,14 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         if remove_wrapper_script(name):
             print(f"✓ Removed {wrapper_path}")
 
-    # 4. Remove attached self-improve worktree/fork if present
-    try:
-        from hermes_cli.self_improve import cleanup_profile_fork
-        cleanup = cleanup_profile_fork(name)
-        if cleanup.get("attached"):
-            print("✓ Removed attached self-improve worktree")
-    except Exception as e:
-        print(f"⚠ Self-improve cleanup: {e}")
-
-    # 5. Remove profile directory
+    # 4. Remove profile directory
     try:
         shutil.rmtree(profile_dir)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
         print(f"⚠ Could not remove {profile_dir}: {e}")
 
-    # 6. Clear active_profile if it pointed to this profile
+    # 5. Clear active_profile if it pointed to this profile
     try:
         active = get_active_profile()
         if active == name:
@@ -663,17 +654,16 @@ def set_active_profile(name: str) -> None:
         tmp.replace(path)
 
 
-def infer_profile_name_from_home_path(home_path: str | Path | None) -> str:
-    """Infer the profile name from a HERMES_HOME-like path.
+def get_active_profile_name() -> str:
+    """Infer the current profile name from HERMES_HOME.
 
-    Returns ``"default"`` for ``~/.hermes`` or a missing path,
-    the profile name for ``~/.hermes/profiles/<name>``, and ``"custom"`` for
-    any other path.
+    Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
+    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
+    Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
     """
-    if not home_path:
-        return "default"
-
-    resolved = Path(home_path).expanduser().resolve()
+    from hermes_constants import get_hermes_home
+    hermes_home = get_hermes_home()
+    resolved = hermes_home.resolve()
 
     default_resolved = _get_default_hermes_home().resolve()
     if resolved == default_resolved:
@@ -689,18 +679,6 @@ def infer_profile_name_from_home_path(home_path: str | Path | None) -> str:
         pass
 
     return "custom"
-
-
-def get_active_profile_name() -> str:
-    """Infer the current profile name from HERMES_HOME.
-
-    Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
-    Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
-    Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
-    """
-    from hermes_constants import get_hermes_home
-    hermes_home = get_hermes_home()
-    return infer_profile_name_from_home_path(hermes_home)
 
 
 # ---------------------------------------------------------------------------
@@ -852,18 +830,6 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         raise FileNotFoundError(f"Profile '{old_name}' does not exist.")
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_name}' already exists.")
-
-    try:
-        from hermes_cli.self_improve import load_profile_fork_info
-        if load_profile_fork_info(old_name):
-            raise ValueError(
-                f"Profile '{old_name}' has an attached self-improve worktree. "
-                "Detach or delete the fork before renaming the profile."
-            )
-    except ValueError:
-        raise
-    except Exception:
-        pass
 
     # 1. Stop gateway if running
     if _check_gateway_running(old_dir):
