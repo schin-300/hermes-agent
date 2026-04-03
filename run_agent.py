@@ -1733,6 +1733,84 @@ class AIAgent:
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
+    def _api_max_retries(self) -> int:
+        """Return the configured outer API retry budget for a conversation turn."""
+        raw_value = os.getenv("HERMES_API_MAX_RETRIES", "20")
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid HERMES_API_MAX_RETRIES=%r; falling back to 20",
+                raw_value,
+            )
+            return 20
+        return max(1, parsed)
+
+    def _infer_api_error_status_code(self, api_error: Exception) -> Optional[int]:
+        """Best-effort HTTP-style status classification for SDK/runtime errors."""
+        for candidate in (
+            getattr(api_error, "status_code", None),
+            getattr(getattr(api_error, "response", None), "status_code", None),
+        ):
+            if isinstance(candidate, int):
+                return candidate
+
+        fragments: list[str] = []
+        for value in (
+            str(api_error),
+            getattr(api_error, "body", None),
+            getattr(getattr(api_error, "response", None), "text", None),
+        ):
+            if not value:
+                continue
+            if isinstance(value, dict):
+                try:
+                    fragments.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
+                except Exception:
+                    fragments.append(str(value))
+            else:
+                fragments.append(str(value))
+
+        haystack = " ".join(fragments).lower()
+        if not haystack:
+            return None
+
+        if any(marker in haystack for marker in (
+            "error code: 401",
+            "http 401",
+            "status code: 401",
+        )):
+            return 401
+        if any(marker in haystack for marker in (
+            "error code: 402",
+            "http 402",
+            "status code: 402",
+            "payment required",
+            "insufficient credits",
+            "credits exhausted",
+            "out of credits",
+        )):
+            return 402
+        if any(marker in haystack for marker in (
+            "error code: 429",
+            "http 429",
+            "status code: 429",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "usage limit",
+            "quota",
+        )):
+            return 429
+        if any(marker in haystack for marker in (
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "authentication failed",
+        )):
+            return 401
+        return None
+
     def _has_content_after_think_block(self, content: str) -> bool:
         """
         Check if content has actual text after any reasoning/thinking blocks.
@@ -4496,6 +4574,8 @@ class AIAgent:
             elif status_code == 401:
                 effective_reason = FailoverReason.auth
 
+        pool_provider = getattr(pool, "provider", "")
+
         if effective_reason == FailoverReason.billing:
             rotate_status = status_code if status_code is not None else 402
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
@@ -4510,6 +4590,17 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
+            if pool_provider == "openai-codex":
+                next_entry = pool.mark_exhausted_and_rotate(status_code=429)
+                if next_entry is not None:
+                    self._emit_status("🔁 Codex profile hit a limit — switching accounts...")
+                    logger.info(
+                        "Codex credential 429/quota — rotated immediately to pool entry %s",
+                        getattr(next_entry, "id", "?"),
+                    )
+                    self._swap_credential(next_entry)
+                    return True, False
+                return False, False
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
@@ -4525,7 +4616,6 @@ class AIAgent:
             return False, True
 
         if effective_reason == FailoverReason.auth:
-            pool_provider = getattr(pool, "provider", "")
             current_entry_getter = getattr(pool, "current", None)
             current_entry = current_entry_getter() if callable(current_entry_getter) else None
             current_id = getattr(current_entry, "id", None)
@@ -7931,7 +8021,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = self._api_max_retries()
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted = False
@@ -8526,7 +8616,7 @@ class AIAgent:
                         # Nothing to sanitize in messages — might be in system
                         # prompt or prefill. Fall through to normal error path.
 
-                    status_code = getattr(api_error, "status_code", None)
+                    status_code = self._infer_api_error_status_code(api_error)
                     error_context = self._extract_api_error_context(api_error)
 
                     # ── Classify the error for structured recovery decisions ──
@@ -8555,6 +8645,33 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+                    pool = self._credential_pool
+                    pool_provider = getattr(pool, "provider", "")
+                    if (
+                        pool is not None
+                        and pool_provider == "openai-codex"
+                        and status_code in {402, 429}
+                        and not pool.has_available()
+                    ):
+                        _final_summary = self._summarize_api_error(api_error)
+                        self._emit_status("⚠️ All Codex profiles are exhausted — trying fallback...")
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            continue
+                        self._vprint(
+                            f"{self.log_prefix}❌ All Codex profiles are exhausted. Giving up without backoff.",
+                            force=True,
+                        )
+                        self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": f"All Codex profiles are exhausted: {_final_summary}",
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _final_summary,
+                        }
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"
@@ -8704,7 +8821,7 @@ class AIAgent:
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
                     # A 413 is a payload-size error — the correct response is to
                     # compress history and retry, not abort immediately.
-                    status_code = getattr(api_error, "status_code", None)
+                    status_code = self._infer_api_error_status_code(api_error)
 
                     # ── Anthropic Sonnet long-context tier gate ───────────
                     # Anthropic returns HTTP 429 "Extra usage is required for
