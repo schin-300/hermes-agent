@@ -4576,9 +4576,17 @@ class AIAgent:
 
         pool_provider = getattr(pool, "provider", "")
 
+        def _rotate_with_optional_error_context(code: int):
+            try:
+                return pool.mark_exhausted_and_rotate(status_code=code, error_context=error_context)
+            except TypeError as exc:
+                if "error_context" not in str(exc):
+                    raise
+                return pool.mark_exhausted_and_rotate(status_code=code)
+
         if effective_reason == FailoverReason.billing:
             rotate_status = status_code if status_code is not None else 402
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = _rotate_with_optional_error_context(rotate_status)
             if next_entry is not None:
                 logger.info(
                     "Credential %s (billing) — rotated to pool entry %s",
@@ -4604,7 +4612,7 @@ class AIAgent:
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = _rotate_with_optional_error_context(rotate_status)
             if next_entry is not None:
                 logger.info(
                     "Credential %s (rate limit) — rotated to pool entry %s",
