@@ -1732,6 +1732,8 @@ class HermesCLI:
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
+        _extra_body_cfg = CLI_CONFIG["model"].get("extra_body")
+        self.extra_body_config = _extra_body_cfg if isinstance(_extra_body_cfg, dict) else None
         
         # OpenRouter provider routing preferences
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
@@ -2843,6 +2845,7 @@ class HermesCLI:
                 reasoning_config=self.reasoning_config,
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
+                extra_body_config=self.extra_body_config,
                 providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore,
                 providers_order=self._providers_order,
