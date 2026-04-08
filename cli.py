@@ -613,11 +613,6 @@ def _run_cleanup():
     # Shut down memory provider (on_session_end + shutdown_all) at actual
     # session boundary — NOT per-turn inside run_conversation().
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook("on_session_finalize", session_id=_active_agent_ref.session_id if _active_agent_ref else None, platform="cli")
-    except Exception:
-        pass
-    try:
         if _active_agent_ref and hasattr(_active_agent_ref, 'shutdown_memory_provider'):
             _active_agent_ref.shutdown_memory_provider(
                 getattr(_active_agent_ref, 'conversation_history', None) or []
@@ -760,10 +755,7 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     """Remove a worktree and its branch on exit.
 
-    Preserves the worktree only if it has unpushed commits (real work
-    that hasn't been pushed to any remote).  Uncommitted changes alone
-    (untracked files, test artifacts) are not enough to keep it — agent
-    work lives in commits/PRs, not the working tree.
+    If the worktree has uncommitted changes, warn and keep it.
     """
     global _active_worktree
     info = info or _active_worktree
@@ -779,27 +771,23 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     if not Path(wt_path).exists():
         return
 
-    # Check for unpushed commits — commits reachable from HEAD but not
-    # from any remote branch.  These represent real work the agent did
-    # but didn't push.
-    has_unpushed = False
+    # Check for uncommitted changes
     try:
-        result = subprocess.run(
-            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
             capture_output=True, text=True, timeout=10, cwd=wt_path,
         )
-        has_unpushed = bool(result.stdout.strip())
+        has_changes = bool(status.stdout.strip())
     except Exception:
-        has_unpushed = True  # Assume unpushed on error — don't delete
+        has_changes = True  # Assume dirty on error — don't delete
 
-    if has_unpushed:
-        print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
-        print(f"  To clean up manually: git worktree remove --force {wt_path}")
+    if has_changes:
+        print(f"\n\033[33m⚠ Worktree has uncommitted changes, keeping: {wt_path}\033[0m")
+        print(f"  To clean up manually: git worktree remove {wt_path}")
         _active_worktree = None
         return
 
-    # Remove worktree (even if working tree is dirty — uncommitted
-    # changes without unpushed commits are just artifacts)
+    # Remove worktree
     try:
         subprocess.run(
             ["git", "worktree", "remove", wt_path, "--force"],
@@ -808,7 +796,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     except Exception as e:
         logger.debug("Failed to remove worktree: %s", e)
 
-    # Delete the branch
+    # Delete the branch (only if it was never pushed / has no upstream)
     try:
         subprocess.run(
             ["git", "branch", "-D", branch],
@@ -822,27 +810,19 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
 
 
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
-    """Remove stale worktrees and orphaned branches on startup.
+    """Remove worktrees older than max_age_hours that have no uncommitted changes.
 
-    Age-based tiers:
-    - Under max_age_hours (24h): skip — session may still be active.
-    - 24h–72h: remove if no unpushed commits.
-    - Over 72h: force remove regardless (nothing should sit this long).
-
-    Also prunes orphaned ``hermes/*`` and ``pr-*`` local branches that
-    have no corresponding worktree.
+    Runs silently on startup to clean up after crashed/killed sessions.
     """
     import subprocess
     import time
 
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
-        _prune_orphaned_branches(repo_root)
         return
 
     now = time.time()
-    soft_cutoff = now - (max_age_hours * 3600)       # 24h default
-    hard_cutoff = now - (max_age_hours * 3 * 3600)   # 72h default
+    cutoff = now - (max_age_hours * 3600)
 
     for entry in worktrees_dir.iterdir():
         if not entry.is_dir() or not entry.name.startswith("hermes-"):
@@ -851,24 +831,21 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         # Check age
         try:
             mtime = entry.stat().st_mtime
-            if mtime > soft_cutoff:
+            if mtime > cutoff:
                 continue  # Too recent — skip
         except Exception:
             continue
 
-        force = mtime <= hard_cutoff  # Over 72h — force remove
-
-        if not force:
-            # 24h–72h tier: only remove if no unpushed commits
-            try:
-                result = subprocess.run(
-                    ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-                    capture_output=True, text=True, timeout=5, cwd=str(entry),
-                )
-                if result.stdout.strip():
-                    continue  # Has unpushed commits — skip
-            except Exception:
-                continue  # Can't check — skip
+        # Check for uncommitted changes
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5, cwd=str(entry),
+            )
+            if status.stdout.strip():
+                continue  # Has changes — skip
+        except Exception:
+            continue  # Can't check — skip
 
         # Safe to remove
         try:
@@ -887,80 +864,9 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
                     ["git", "branch", "-D", branch],
                     capture_output=True, text=True, timeout=10, cwd=repo_root,
                 )
-            logger.debug("Pruned stale worktree: %s (force=%s)", entry.name, force)
+            logger.debug("Pruned stale worktree: %s", entry.name)
         except Exception as e:
             logger.debug("Failed to prune worktree %s: %s", entry.name, e)
-
-    _prune_orphaned_branches(repo_root)
-
-
-def _prune_orphaned_branches(repo_root: str) -> None:
-    """Delete local ``hermes/hermes-*`` and ``pr-*`` branches with no worktree.
-
-    These are auto-generated by ``hermes -w`` sessions and PR review
-    workflows respectively.  Once their worktree is gone they serve no
-    purpose and just accumulate.
-    """
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            ["git", "branch", "--format=%(refname:short)"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
-        )
-        if result.returncode != 0:
-            return
-        all_branches = [b.strip() for b in result.stdout.strip().split("\n") if b.strip()]
-    except Exception:
-        return
-
-    # Collect branches that are actively checked out in a worktree
-    active_branches: set = set()
-    try:
-        wt_result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
-        )
-        for line in wt_result.stdout.split("\n"):
-            if line.startswith("branch refs/heads/"):
-                active_branches.add(line.split("branch refs/heads/", 1)[-1].strip())
-    except Exception:
-        return  # Can't determine active branches — bail
-
-    # Also protect the currently checked-out branch and main
-    try:
-        head_result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5, cwd=repo_root,
-        )
-        current = head_result.stdout.strip()
-        if current:
-            active_branches.add(current)
-    except Exception:
-        pass
-    active_branches.add("main")
-
-    orphaned = [
-        b for b in all_branches
-        if b not in active_branches
-        and (b.startswith("hermes/hermes-") or b.startswith("pr-"))
-    ]
-
-    if not orphaned:
-        return
-
-    # Delete in batches
-    for i in range(0, len(orphaned), 50):
-        batch = orphaned[i:i + 50]
-        try:
-            subprocess.run(
-                ["git", "branch", "-D"] + batch,
-                capture_output=True, text=True, timeout=30, cwd=repo_root,
-            )
-        except Exception as e:
-            logger.debug("Failed to prune orphaned branches: %s", e)
-
-    logger.debug("Pruned %d orphaned branches", len(orphaned))
 
 # ============================================================================
 # ASCII Art & Branding
@@ -1417,7 +1323,6 @@ class HermesCLI:
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
-        self.codex_service_tier = None
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -1479,8 +1384,6 @@ class HermesCLI:
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
-        _extra_body_cfg = CLI_CONFIG["model"].get("extra_body")
-        self.extra_body_config = _extra_body_cfg if isinstance(_extra_body_cfg, dict) else None
         
         # OpenRouter provider routing preferences
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
@@ -1559,7 +1462,6 @@ class HermesCLI:
         self._command_status = ""
         self._attached_images: list[Path] = []
         self._image_counter = 0
-        self._last_assistant_message_text: str = ""
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
 
@@ -1655,6 +1557,32 @@ class HermesCLI:
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # Credential pool status (for codex and other pooled providers)
+        pool = getattr(agent, "_credential_pool", None)
+        if pool and hasattr(pool, "current"):
+            cred = pool.current()
+            if cred:
+                snapshot["credential_status"] = cred.last_status or "ok"
+                snapshot["credential_request_count"] = cred.request_count or 0
+                reset_at = cred.last_error_reset_at
+                if reset_at:
+                    import time as _time
+                    delta = max(0, reset_at - _time.time())
+                    snapshot["credential_resets_in_min"] = round(delta / 60, 1)
+                else:
+                    snapshot["credential_resets_in_min"] = None
+                snapshot["credential_exhausted"] = cred.last_status == "exhausted"
+            else:
+                snapshot["credential_status"] = None
+                snapshot["credential_request_count"] = 0
+                snapshot["credential_resets_in_min"] = None
+                snapshot["credential_exhausted"] = False
+        else:
+            snapshot["credential_status"] = None
+            snapshot["credential_request_count"] = 0
+            snapshot["credential_resets_in_min"] = None
+            snapshot["credential_exhausted"] = False
+
         return snapshot
 
     @staticmethod
@@ -1713,11 +1641,22 @@ class HermesCLI:
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
 
+            # Credential pool label — only shown when there's actionable info
+            # (exhaustion, rate-limiting, etc). Silent during normal operation.
+            cred_label = ""
+            if snapshot.get("credential_exhausted"):
+                resets_min = snapshot.get("credential_resets_in_min")
+                cred_label = "⚠ exhausted"
+                if resets_min is not None:
+                    cred_label += f" (reset {resets_min}m)"
+
             if width < 52:
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                if cred_label:
+                    parts.append(cred_label)
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
@@ -1729,6 +1668,8 @@ class HermesCLI:
                 context_label = "ctx --"
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            if cred_label:
+                parts.append(cred_label)
             parts.append(duration_label)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
@@ -1751,6 +1692,19 @@ class HermesCLI:
                 width = shutil.get_terminal_size((80, 24)).columns
             duration_label = snapshot["duration"]
 
+            # Credential pool fragments — only when there's actionable info
+            cred_frags = []
+            if snapshot.get("credential_exhausted"):
+                resets_min = snapshot.get("credential_resets_in_min")
+                cred_frags = [
+                    ("class:status-bar-dim", " │ "),
+                    ("class:status-bar-bad", "⚠ exhausted"),
+                ]
+                if resets_min is not None:
+                    cred_frags.append(
+                        ("class:status-bar-dim", f" (reset {resets_min}m)")
+                    )
+
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
@@ -1768,10 +1722,13 @@ class HermesCLI:
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
+                    ]
+                    frags.extend(cred_frags)
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
@@ -1790,10 +1747,13 @@ class HermesCLI:
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
+                    ]
+                    frags.extend(cred_frags)
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
@@ -2441,7 +2401,6 @@ class HermesCLI:
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
                 api_mode=runtime.get("api_mode"),
-                service_tier=self.codex_service_tier,
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
@@ -2452,7 +2411,6 @@ class HermesCLI:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
-                extra_body_config=self.extra_body_config,
                 providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore,
                 providers_order=self._providers_order,
@@ -2813,51 +2771,6 @@ class HermesCLI:
             return True
         self._image_counter -= 1
         return False
-
-    @staticmethod
-    def _assistant_copy_shortcut_label() -> str:
-        return "Alt+C"
-
-    @classmethod
-    def _assistant_copy_hint_text(cls) -> str:
-        return f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
-
-    def _remember_assistant_message(self, text: Optional[str]) -> None:
-        """Store and publish the latest assistant-visible message."""
-        plain = _rich_text_from_ansi(text or "").plain
-        if plain.strip():
-            self._last_assistant_message_text = plain
-            self._publish_latest_reply_to_overlay(plain)
-
-    def _show_assistant_copy_hint(self) -> None:
-        if not getattr(self, "_app", None):
-            return
-        ChatConsole().print(f"[dim]{_escape(self._assistant_copy_hint_text())}[/]")
-
-    def _copy_latest_assistant_message(self) -> tuple[bool, str]:
-        """Copy the latest assistant reply shown in the interactive chat."""
-        latest = getattr(self, "_last_assistant_message_text", "")
-        if not latest.strip():
-            return False, "No assistant reply yet to copy."
-
-        from hermes_cli.clipboard import copy_text_to_clipboard
-
-        ok, error = copy_text_to_clipboard(latest)
-        if ok:
-            return True, "Copied latest assistant reply to the system clipboard."
-        if error:
-            return False, f"Clipboard copy failed: {error}"
-        return False, "Clipboard copy failed."
-
-    def _register_copy_shortcut(self, kb: KeyBindings) -> None:
-        """Bind Alt+C to copy the latest assistant reply."""
-
-        @kb.add('escape', 'c')
-        def handle_copy_latest_reply(event):
-            ok, message = self._copy_latest_assistant_message()
-            icon = "⧉" if ok else "⚠"
-            _cprint(f"  {_DIM}{icon} {message}{_RST}")
-            event.app.invalidate()
 
     def _handle_rollback_command(self, command: str):
         """Handle /rollback — list, diff, or restore filesystem checkpoints.
@@ -3459,22 +3372,6 @@ class HermesCLI:
         flush_tool_summary()
         print()
     
-    def _notify_session_boundary(self, event_type: str) -> None:
-        """Fire a session-boundary plugin hook (on_session_finalize or on_session_reset).
-
-        Non-blocking — errors are caught and logged.  Safe to call from any
-        lifecycle point (shutdown, /new, /reset).
-        """
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                event_type,
-                session_id=self.agent.session_id if self.agent else None,
-                platform=getattr(self, "platform", None) or "cli",
-            )
-        except Exception:
-            pass
-
     def new_session(self, silent=False):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
@@ -3482,10 +3379,6 @@ class HermesCLI:
                 self.agent.flush_memories(self.conversation_history)
             except (Exception, KeyboardInterrupt):
                 pass
-            self._notify_session_boundary("on_session_finalize")
-        elif self.agent:
-            # First session or empty history — still finalize the old session
-            self._notify_session_boundary("on_session_finalize")
 
         old_session_id = self.session_id
         if self._session_db and old_session_id:
@@ -3501,13 +3394,11 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self.codex_service_tier = None
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reset_session_state()
-            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -3532,7 +3423,6 @@ class HermesCLI:
                     )
                 except Exception:
                     pass
-            self._notify_session_boundary("on_session_reset")
 
         if not silent:
             print("(^_^)v New session started!")
@@ -3578,7 +3468,6 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
-        self.codex_service_tier = None
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3595,7 +3484,6 @@ class HermesCLI:
         if self.agent:
             self.agent.session_id = target_id
             self.agent.reset_session_state()
-            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -4644,8 +4532,6 @@ class HermesCLI:
             self._toggle_verbose()
         elif canonical == "yolo":
             self._toggle_yolo()
-        elif canonical == "fast":
-            self._handle_fast_command(cmd_original)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "compress":
@@ -4875,7 +4761,6 @@ class HermesCLI:
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
                     api_mode=turn_route["runtime"].get("api_mode"),
-                    service_tier=self.codex_service_tier,
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
@@ -4928,7 +4813,6 @@ class HermesCLI:
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
-                    self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -4950,7 +4834,6 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
-                    self._show_assistant_copy_hint()
                 else:
                     _cprint("  (No response generated)")
 
@@ -5058,7 +4941,6 @@ class HermesCLI:
                 print()
 
                 if response:
-                    self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -5074,7 +4956,6 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
-                    self._show_assistant_copy_hint()
                 else:
                     _cprint("  💬 /btw: (no response)")
 
@@ -5364,37 +5245,6 @@ class HermesCLI:
         else:
             os.environ["HERMES_YOLO_MODE"] = "1"
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
-
-    def _handle_fast_command(self, cmd: str):
-        """Handle /fast — session-local Codex fast mode."""
-        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
-
-        parts = cmd.strip().split(maxsplit=1)
-        action = parse_fast_command_arg(parts[1] if len(parts) > 1 else "")
-        if action is None:
-            _cprint(f"  {_DIM}Usage: {FAST_MODE_USAGE}{_RST}")
-            return
-
-        current_enabled = self.codex_service_tier == "fast"
-        if action == "status":
-            enabled = current_enabled
-        elif action == "toggle":
-            enabled = not current_enabled
-        else:
-            enabled = action == "on"
-
-        if action != "status":
-            self.codex_service_tier = "fast" if enabled else None
-            if self.agent:
-                self.agent.service_tier = self.codex_service_tier
-
-        provider = getattr(self.agent, "provider", None) if self.agent else getattr(self, "provider", None)
-        model = getattr(self.agent, "model", None) if self.agent else getattr(self, "model", None)
-        state = "ON ✓" if enabled else "off"
-        _cprint(f"  {_GOLD}Fast mode: {state}{_RST}")
-        _cprint(f"  {_DIM}{fast_mode_note(provider=provider, model=model, enabled=enabled)}{_RST}")
-        if action != "status":
-            _cprint(f"  {_DIM}Takes effect on the next message.{_RST}")
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -6825,8 +6675,6 @@ class HermesCLI:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
 
             response_previewed = result.get("response_previewed", False) if result else False
-            if response:
-                self._remember_assistant_message(response)
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -6887,8 +6735,6 @@ class HermesCLI:
                         padding=(1, 2),
                     ))
 
-            if response:
-                self._show_assistant_copy_hint()
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
@@ -7278,7 +7124,6 @@ class HermesCLI:
         
         # Key bindings for the input area
         kb = KeyBindings()
-        self._register_copy_shortcut(kb)
         
         @kb.add('enter')
         def handle_enter(event):

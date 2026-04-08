@@ -361,3 +361,98 @@ class TestStatusBarWidthSource:
         mock_get_app.assert_not_called()
         mock_shutil.assert_not_called()
         assert len(text) > 0
+
+
+class TestCredentialPoolStatusBar:
+    """Tests for credential pool status display in the status bar."""
+
+    @staticmethod
+    def _make_agent_with_pool(cred_status="ok", request_count=42, reset_at=None):
+        """Create a mock agent with a credential pool."""
+        cred = SimpleNamespace(
+            last_status=cred_status,
+            last_error_reset_at=reset_at,
+            request_count=request_count,
+        )
+        pool = SimpleNamespace(current=lambda: cred)
+        return SimpleNamespace(
+            model="gpt-5.4",
+            provider="openai-codex",
+            session_input_tokens=100,
+            session_output_tokens=50,
+            session_cache_read_tokens=0,
+            session_cache_write_tokens=0,
+            session_prompt_tokens=100,
+            session_completion_tokens=50,
+            session_total_tokens=150,
+            session_api_calls=3,
+            context_compressor=SimpleNamespace(
+                last_prompt_tokens=5000,
+                context_length=100000,
+                compression_count=0,
+            ),
+            _credential_pool=pool,
+        )
+
+    def test_snapshot_shows_credential_status(self):
+        cli_obj = _make_cli()
+        cli_obj.agent = self._make_agent_with_pool(cred_status="ok", request_count=42)
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["credential_status"] == "ok"
+        assert snapshot["credential_request_count"] == 42
+        assert snapshot["credential_exhausted"] is False
+
+    def test_snapshot_shows_exhausted(self):
+        cli_obj = _make_cli()
+        import time
+        cli_obj.agent = self._make_agent_with_pool(
+            cred_status="exhausted", request_count=100, reset_at=time.time() + 3600
+        )
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["credential_exhausted"] is True
+        assert snapshot["credential_resets_in_min"] is not None
+        assert snapshot["credential_resets_in_min"] > 50  # ~60 min
+
+    def test_snapshot_no_pool(self):
+        cli_obj = _make_cli()
+        cli_obj.agent = SimpleNamespace(
+            model="claude",
+            provider="anthropic",
+            session_input_tokens=100,
+            session_output_tokens=50,
+            session_cache_read_tokens=0,
+            session_cache_write_tokens=0,
+            session_prompt_tokens=100,
+            session_completion_tokens=50,
+            session_total_tokens=150,
+            session_api_calls=3,
+            context_compressor=SimpleNamespace(
+                last_prompt_tokens=5000,
+                context_length=100000,
+                compression_count=0,
+            ),
+            _credential_pool=None,
+        )
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["credential_status"] is None
+        assert snapshot["credential_exhausted"] is False
+
+    def test_status_bar_silent_when_ok(self):
+        cli_obj = _make_cli()
+        cli_obj.agent = self._make_agent_with_pool(cred_status="ok", request_count=42)
+        text = cli_obj._build_status_bar_text(width=120)
+        # Should NOT show req count during normal operation
+        assert "reqs" not in text
+        assert "exhausted" not in text
+
+    def test_status_bar_shows_exhausted_warning(self):
+        cli_obj = _make_cli()
+        import time
+        cli_obj.agent = self._make_agent_with_pool(
+            cred_status="exhausted", request_count=100, reset_at=time.time() + 3600
+        )
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "exhausted" in text
