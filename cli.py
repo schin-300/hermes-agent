@@ -1418,6 +1418,7 @@ class HermesCLI:
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.codex_service_tier = None
+        self.context_length_override: Optional[int] = None
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -1606,6 +1607,15 @@ class HermesCLI:
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
+    def _current_context_limit(self) -> Optional[int]:
+        agent = getattr(self, "agent", None)
+        compressor = getattr(agent, "context_compressor", None) if agent else None
+        context_length = getattr(compressor, "context_length", None) if compressor else None
+        if context_length:
+            return int(context_length)
+        override = getattr(self, "context_length_override", None)
+        return int(override) if override else None
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -1625,7 +1635,7 @@ class HermesCLI:
             "model_short": model_short,
             "duration": format_duration_compact(elapsed_seconds),
             "context_tokens": 0,
-            "context_length": None,
+            "context_length": self._current_context_limit(),
             "context_percent": None,
             "session_input_tokens": 0,
             "session_output_tokens": 0,
@@ -2471,6 +2481,7 @@ class HermesCLI:
                 reasoning_callback=self._current_reasoning_callback(),
 
                 fallback_model=self._fallback_model,
+                context_length_override=self.context_length_override,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
@@ -2515,9 +2526,7 @@ class HermesCLI:
 
         # Get context length for display before branching so it remains
         # available to the low-context warning logic in compact mode too.
-        ctx_len = None
-        if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-            ctx_len = self.agent.context_compressor.context_length
+        ctx_len = self._current_context_limit()
         
         # Auto-compact for narrow terminals — the full banner with caduceus
         # + tool list needs ~80 columns minimum to render without wrapping.
@@ -3537,10 +3546,13 @@ class HermesCLI:
         self._pending_title = None
         self._resumed = False
         self.codex_service_tier = None
+        self.context_length_override = None
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
+            if hasattr(self.agent, "set_context_length_override"):
+                self.agent.set_context_length_override(None)
             self.agent.reset_session_state()
             self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
@@ -3614,6 +3626,7 @@ class HermesCLI:
         self._resumed = True
         self._pending_title = None
         self.codex_service_tier = None
+        self.context_length_override = None
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3629,6 +3642,8 @@ class HermesCLI:
         # Sync the agent if already initialised
         if self.agent:
             self.agent.session_id = target_id
+            if hasattr(self.agent, "set_context_length_override"):
+                self.agent.set_context_length_override(None)
             self.agent.reset_session_state()
             self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
@@ -4554,9 +4569,7 @@ class HermesCLI:
                 else:
                     tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-                    ctx_len = None
-                    if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-                        ctx_len = self.agent.context_compressor.context_length
+                    ctx_len = self._current_context_limit()
                     build_welcome_banner(
                         console=cc,
                         model=self.model,
@@ -4628,6 +4641,8 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "context-limit":
+            self._handle_context_limit_command(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "prompt":
@@ -5415,6 +5430,31 @@ class HermesCLI:
         _cprint(f"  {_DIM}{fast_mode_note(provider=provider, model=model, enabled=enabled)}{_RST}")
         if action != "status":
             _cprint(f"  {_DIM}Takes effect on the next message.{_RST}")
+
+    def _handle_context_limit_command(self, cmd: str):
+        """Handle /context-limit — session-local context window override."""
+        from hermes_cli.context_limit import (
+            CONTEXT_LIMIT_USAGE,
+            cycle_context_limit,
+            parse_context_limit_value,
+        )
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            target = parse_context_limit_value(parts[1])
+            if target is None:
+                _cprint(f"  {_DIM}Usage: {CONTEXT_LIMIT_USAGE}{_RST}")
+                return
+        else:
+            target = cycle_context_limit(self._current_context_limit())
+
+        self.context_length_override = target
+        applied = target
+        if self.agent and hasattr(self.agent, "set_context_length_override"):
+            applied = self.agent.set_context_length_override(target)
+
+        _cprint(f"  {_GOLD}Context limit: {applied:,} tokens{_RST}")
+        _cprint(f"  {_DIM}Session only — resets on /new or /resume.{_RST}")
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -6621,9 +6661,7 @@ class HermesCLI:
         if isinstance(message, str) and "@" in message:
             try:
                 from agent.context_references import preprocess_context_references
-                from agent.model_metadata import get_model_context_length
-                _ctx_len = get_model_context_length(
-                    self.model, base_url=self.base_url or "", api_key=self.api_key or "")
+                _ctx_len = self._current_context_limit()
                 _ctx_result = preprocess_context_references(
                     message, cwd=os.getcwd(), context_length=_ctx_len)
                 if _ctx_result.expanded or _ctx_result.blocked:
