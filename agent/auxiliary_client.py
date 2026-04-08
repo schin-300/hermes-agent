@@ -1495,20 +1495,24 @@ def _strict_vision_backend_available(provider: str) -> bool:
     return _resolve_strict_vision_backend(provider)[0] is not None
 
 
-def _preferred_main_vision_provider() -> Optional[str]:
-    """Return the selected main provider when it is also a supported vision backend."""
-    try:
-        from hermes_cli.config import load_config
+def _read_active_provider_for_vision() -> str:
+    """Return the user's active provider for vision auto fallback.
 
-        config = load_config()
-        model_cfg = config.get("model", {})
-        if isinstance(model_cfg, dict):
-            provider = _normalize_vision_provider(model_cfg.get("provider", ""))
-            if provider in _VISION_AUTO_PROVIDER_ORDER:
-                return provider
+    Prefer config.yaml's main provider, but fall back to auth.json active_provider
+    when no main provider is configured there.
+    """
+    main_provider = _read_main_provider()
+    if main_provider and main_provider not in ("auto", ""):
+        return main_provider
+    try:
+        from hermes_cli.auth import get_active_provider
+
+        active_provider = _normalize_vision_provider(get_active_provider())
+        if active_provider and active_provider not in ("auto", ""):
+            return active_provider
     except Exception:
         pass
-    return None
+    return ""
 
 
 def get_available_vision_backends() -> List[str]:
@@ -1519,8 +1523,8 @@ def get_available_vision_backends() -> List[str]:
     vision tasks.
     """
     available: List[str] = []
-    # 1. Active provider — if the user configured a provider, try it first.
-    main_provider = _read_main_provider()
+    # 1. Active provider — from config when set, otherwise auth-store fallback.
+    main_provider = _read_active_provider_for_vision()
     if main_provider and main_provider not in ("auto", ""):
         if main_provider in _VISION_AUTO_PROVIDER_ORDER:
             if _strict_vision_backend_available(main_provider):
@@ -1579,11 +1583,11 @@ def resolve_vision_provider_client(
 
     if requested == "auto":
         # Vision auto-detection order:
-        #   1. Active provider + model (user's main chat config)
+        #   1. Active provider + model (main config, then auth-store fallback)
         #   2. OpenRouter  (known vision-capable default model)
         #   3. Nous Portal (known vision-capable default model)
         #   4. Stop
-        main_provider = _read_main_provider()
+        main_provider = _read_active_provider_for_vision()
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
             if main_provider in _VISION_AUTO_PROVIDER_ORDER:
