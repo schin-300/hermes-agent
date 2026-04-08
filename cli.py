@@ -3707,10 +3707,11 @@ class HermesCLI:
         except Exception:
             pass
 
-        # Create the new session with parent link
+        # Create the new session with parent link and copied transcript
         try:
-            self._session_db.create_session(
-                session_id=new_session_id,
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
                 model_config={
@@ -3718,31 +3719,12 @@ class HermesCLI:
                     "reasoning_config": self.reasoning_config,
                 },
                 parent_session_id=parent_session_id,
+                title=branch_title,
+                messages=self.conversation_history,
             )
         except Exception as e:
             _cprint(f"  Failed to create branch session: {e}")
             return
-
-        # Copy conversation history to the new session
-        for msg in self.conversation_history:
-            try:
-                self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    reasoning=msg.get("reasoning"),
-                )
-            except Exception:
-                pass  # Best-effort copy
-
-        # Set title on the branch
-        try:
-            self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
 
         # Switch to the new session
         self.session_id = new_session_id
@@ -3774,6 +3756,177 @@ class HermesCLI:
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
 
+    def _handle_spawn_command(self, cmd: str):
+        """Handle /spawn <prompt> — run a prompt in a child session clone."""
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /spawn <prompt>")
+            _cprint("  Example: /spawn Continue this research in the background")
+            _cprint("  Clones the current session, keeps you here, and runs the prompt in the child.")
+            return
+
+        if not self.conversation_history:
+            _cprint("  No conversation to spawn from — send a message first.")
+            return
+
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start spawn task: no valid credentials.")
+            return
+
+        prompt = parts[1].strip()
+        history_snapshot = list(self.conversation_history)
+        parent_session_id = self.session_id
+        now = datetime.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        current_title = self._session_db.get_session_title(parent_session_id)
+        base_title = current_title or "spawn"
+        child_title = self._session_db.get_next_title_in_lineage(base_title)
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
+                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=None,
+                model_config={
+                    "max_iterations": self.max_turns,
+                    "reasoning_config": self.reasoning_config,
+                },
+                parent_session_id=parent_session_id,
+                title=child_title,
+                messages=history_snapshot,
+            )
+        except Exception as e:
+            _cprint(f"  Failed to create spawn session: {e}")
+            return
+
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"spawn_{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        _cprint(f'  🪄 Spawn task #{task_num} started: "{preview}"')
+        _cprint(f"  Task ID:         {task_id}")
+        _cprint(f"  Parent session:  {parent_session_id}")
+        _cprint(f"  Child session:   {new_session_id}")
+        _cprint("  You stay on the current session — results will appear here when done.\n")
+
+        turn_route = self._resolve_turn_agent_config(prompt)
+
+        def run_spawn():
+            try:
+                spawn_agent = AIAgent(
+                    model=turn_route["model"],
+                    api_key=turn_route["runtime"].get("api_key"),
+                    base_url=turn_route["runtime"].get("base_url"),
+                    provider=turn_route["runtime"].get("provider"),
+                    api_mode=turn_route["runtime"].get("api_mode"),
+                    acp_command=turn_route["runtime"].get("command"),
+                    acp_args=turn_route["runtime"].get("args"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=new_session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                )
+                spawn_agent._print_fn = lambda *_a, **_kw: None
+
+                def _spawn_thinking(text: str) -> None:
+                    if not self._agent_running:
+                        self._spinner_text = text
+                        if self._app:
+                            self._app.invalidate()
+
+                spawn_agent.thinking_callback = _spawn_thinking
+                result = spawn_agent.run_conversation(
+                    user_message=prompt,
+                    conversation_history=history_snapshot,
+                    task_id=task_id,
+                )
+
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                _cprint(f"  ✅ Spawn task #{task_num} complete")
+                _cprint(f"  Prompt: \"{preview}\"")
+                _cprint(f"  Child session: {new_session_id}")
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                if response:
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _skin = get_active_skin()
+                        label = _skin.get_branding("response_label", "⚕ Hermes")
+                        _resp_color = _skin.get_color("response_border", "#CD7F32")
+                        _resp_text = _skin.get_color("banner_text", "#FFF8DC")
+                    except Exception:
+                        label = "⚕ Hermes"
+                        _resp_color = "#CD7F32"
+                        _resp_text = "#FFF8DC"
+
+                    _chat_console = ChatConsole()
+                    _chat_console.print(Panel(
+                        _rich_text_from_ansi(response),
+                        title=f"[{_resp_color} bold]{label} (spawn #{task_num})[/]",
+                        title_align="left",
+                        border_style=_resp_color,
+                        style=_resp_text,
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 2),
+                    ))
+                else:
+                    _cprint("  (No response generated)")
+
+                if self.bell_on_complete:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                _cprint(f"  ❌ Spawn task #{task_num} failed: {e}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if not self._agent_running:
+                    self._spinner_text = ""
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(target=run_spawn, daemon=True, name=f"spawn-task-{task_id}")
+        self._background_tasks[task_id] = thread
+        thread.start()
+
+    def reset_conversation(self):
+        """Reset the conversation by starting a new session."""
+        # Shut down memory provider before resetting — actual session boundary
+        if hasattr(self, 'agent') and self.agent:
+            self.agent.shutdown_memory_provider(self.conversation_history)
+        self.new_session()
+    
     def save_conversation(self):
         """Save the current conversation to a file."""
         if not self.conversation_history:
@@ -4657,6 +4810,8 @@ class HermesCLI:
             self.undo_last()
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "spawn":
+            self._handle_spawn_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":
