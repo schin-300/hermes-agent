@@ -1880,12 +1880,15 @@ class GatewayRunner:
             _stale_agent = self._running_agents.get(_quick_key)
             # Never evict the pending sentinel — it was just placed moments
             # ago during the async setup phase before the real agent is
-            # created.  Sentinels have no get_activity_summary(), so the
-            # idle check below would always evaluate to inf >= timeout and
-            # immediately evict them, racing with the setup path.
+            # created. Sentinels have no get_activity_summary(), so the
+            # idle check below would otherwise treat them as stale.
             _stale_idle = float("inf")  # assume idle if we can't check
             _stale_detail = ""
-            if _stale_agent and hasattr(_stale_agent, "get_activity_summary"):
+            if (
+                _stale_agent
+                and _stale_agent is not _AGENT_PENDING_SENTINEL
+                and hasattr(_stale_agent, "get_activity_summary")
+            ):
                 try:
                     _sa = _stale_agent.get_activity_summary()
                     _stale_idle = _sa.get("seconds_since_activity", float("inf"))
@@ -1896,9 +1899,11 @@ class GatewayRunner:
                     )
                 except Exception:
                     pass
-            # Evict if: agent is idle beyond timeout, OR wall-clock age is
-            # extreme (10x timeout or 2h, whichever is larger — catches
-            # cases where the agent object was garbage-collected).
+            # Evict if: agent is idle beyond timeout (only when we have a real
+            # activity tracker), OR wall-clock age is extreme (10x timeout or
+            # 2h, whichever is larger — catches leaked entries / dead objects).
+            # Do not treat the pending sentinel as idle=inf; it has no activity
+            # tracker by design and must be allowed to survive normal startup.
             _wall_ttl = max(_raw_stale_timeout * 10, 7200) if _raw_stale_timeout > 0 else float("inf")
             _should_evict = (
                 _stale_agent is not _AGENT_PENDING_SENTINEL
@@ -1996,6 +2001,11 @@ class GatewayRunner:
                 if _cmd_def_inner.name == "approve":
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
+
+            # /spawn must bypass the running-agent interrupt path so the child
+            # session can clone the latest in-memory snapshot immediately.
+            if _cmd_def_inner and _cmd_def_inner.name == "spawn":
+                return await self._handle_spawn_command(event)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
@@ -4570,7 +4580,14 @@ class GatewayRunner:
 
         source = event.source
         current_entry = self.session_store.get_or_create_session(source)
-        history = self.session_store.load_transcript(current_entry.session_id)
+        session_key = self._session_key_for_source(source)
+        running_agent = self._running_agents.get(session_key)
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            history = list(getattr(running_agent, "_session_messages", []) or [])
+        else:
+            history = []
+        if not history:
+            history = self.session_store.load_transcript(current_entry.session_id)
         if not history:
             return "No conversation to spawn from — send a message first."
 
@@ -4595,7 +4612,14 @@ class GatewayRunner:
             return f"Failed to create spawn session: {e}"
 
         _task = asyncio.create_task(
-            self._run_spawn_task(prompt, source, task_id, new_session_id, history)
+            self._run_spawn_task(
+                prompt,
+                source,
+                task_id,
+                new_session_id,
+                history,
+                parent_session_id=current_entry.session_id,
+            )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
@@ -4608,6 +4632,28 @@ class GatewayRunner:
             f"Child session: {new_session_id}\n"
             "You stay on the current session — results will appear here when done."
         )
+
+    def _persist_spawn_result_to_parent(self, parent_session_id: str | None, content: str) -> None:
+        """Append the final /spawn result to the parent session transcript."""
+        if not parent_session_id or not content:
+            return
+        try:
+            self.session_store.append_to_transcript(
+                parent_session_id,
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "timestamp": datetime.now().isoformat(),
+                    "mirror": True,
+                    "mirror_source": "spawn",
+                },
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to persist /spawn result to parent session %s: %s",
+                parent_session_id,
+                exc,
+            )
 
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
@@ -4746,6 +4792,7 @@ class GatewayRunner:
         task_id: str,
         child_session_id: str,
         history_snapshot: list[dict],
+        parent_session_id: str | None = None,
     ) -> None:
         """Execute a cloned-session background task and deliver the result."""
         from run_agent import AIAgent
@@ -4760,9 +4807,11 @@ class GatewayRunner:
         try:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
+                error_content = f"❌ Spawn task {task_id} failed: no provider credentials configured."
+                self._persist_spawn_result_to_parent(parent_session_id, error_content)
                 await adapter.send(
                     source.chat_id,
-                    f"❌ Spawn task {task_id} failed: no provider credentials configured.",
+                    error_content,
                     metadata=_thread_metadata,
                 )
                 return
@@ -4825,6 +4874,8 @@ class GatewayRunner:
             if response:
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
+                persisted_text = header + (text_content or "(See attached media)")
+                self._persist_spawn_result_to_parent(parent_session_id, persisted_text)
 
                 if text_content:
                     await adapter.send(
@@ -4858,6 +4909,10 @@ class GatewayRunner:
                     except Exception:
                         pass
             else:
+                self._persist_spawn_result_to_parent(
+                    parent_session_id,
+                    header + "(No response generated)",
+                )
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=header + "(No response generated)",
@@ -4867,9 +4922,11 @@ class GatewayRunner:
         except Exception as e:
             logger.exception("Spawn task %s failed", task_id)
             try:
+                error_content = f"❌ Spawn task {task_id} failed: {e}"
+                self._persist_spawn_result_to_parent(parent_session_id, error_content)
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Spawn task {task_id} failed: {e}",
+                    content=error_content,
                     metadata=_thread_metadata,
                 )
             except Exception:
