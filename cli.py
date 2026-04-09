@@ -73,6 +73,11 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # User-managed env files should override stale shell exports on restart.
 from hermes_constants import get_hermes_home, display_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.kitty_overlay import (
+    DEFAULT_TIMEOUT_RESPONSE as KITTY_OVERLAY_TIMEOUT_RESPONSE,
+    kitty_overlay_available,
+    prompt_kitty_overlay_clarify,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -636,13 +641,15 @@ def _run_cleanup():
 _active_worktree: Optional[Dict[str, str]] = None
 
 
-def _git_repo_root() -> Optional[str]:
-    """Return the git repo root for CWD, or None if not in a repo."""
+def _git_repo_root(cwd: str | None = None) -> Optional[str]:
+    """Return the git repo root for ``cwd`` (or the active terminal cwd)."""
     import subprocess
+
+    target_cwd = cwd or os.getenv("TERMINAL_CWD") or os.getcwd()
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, cwd=target_cwd,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -658,6 +665,46 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _git_remote_exists(repo_root: str, remote_name: str) -> bool:
+    """Return True when ``remote_name`` exists in ``repo_root``."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", remote_name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_root,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+
+def _git_default_base_ref(repo_root: str, remote_name: str = "origin") -> str:
+    """Return the remote default branch ref, e.g. ``origin/main``."""
+    import subprocess
+
+    fallback = f"{remote_name}/main"
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", f"refs/remotes/{remote_name}/HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_root,
+        )
+        if result.returncode == 0:
+            ref = result.stdout.strip()
+            if ref.startswith("refs/remotes/"):
+                return ref[len("refs/remotes/"):]
+    except Exception:
+        pass
+    return fallback
 
 
 def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
@@ -1568,6 +1615,7 @@ class HermesCLI:
         self._approval_state = None
         self._approval_deadline = 0
         self._approval_lock = threading.Lock()
+        self._background_prompt_lock = threading.Lock()
         self._secret_state = None
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
@@ -1816,7 +1864,60 @@ class HermesCLI:
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        snapshot["background_tasks"] = self._background_agent_count()
         return snapshot
+
+    def _background_agent_count(self, extra_tasks: int = 0) -> int:
+        tasks = getattr(self, "_background_tasks", None)
+        if isinstance(tasks, dict):
+            return max(0, len(tasks) + int(extra_tasks))
+        return max(0, int(extra_tasks))
+
+    def _background_status_note(self, extra_tasks: int = 0) -> str:
+        count = self._background_agent_count(extra_tasks=extra_tasks)
+        noun = "agent" if count == 1 else "agents"
+        return f"({count} background {noun} running)"
+
+    def _show_background_agent_count_note(self, extra_tasks: int = 0) -> None:
+        count = self._background_agent_count(extra_tasks=extra_tasks)
+        if count > 0:
+            _cprint(f"  {_DIM}{self._background_status_note(extra_tasks=extra_tasks)}{_RST}")
+
+    def _make_background_clarify_callback(self, task_label: str):
+        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+
+        def _callback(question, choices):
+            prompt_lock = getattr(self, "_background_prompt_lock", None)
+            if prompt_lock is None:
+                prompt_lock = threading.Lock()
+                self._background_prompt_lock = prompt_lock
+
+            with prompt_lock:
+                if kitty_overlay_available():
+                    try:
+                        return prompt_kitty_overlay_clarify(
+                            question,
+                            choices,
+                            task_label=f"Hermes {task_label}",
+                            timeout=timeout,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Kitty overlay clarify failed for %s",
+                            task_label,
+                            exc_info=True,
+                        )
+                try:
+                    return self._clarify_callback(question, choices)
+                except Exception:
+                    logger.debug(
+                        "Inline clarify fallback failed for %s",
+                        task_label,
+                        exc_info=True,
+                    )
+                    return KITTY_OVERLAY_TIMEOUT_RESPONSE
+
+        return _callback
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -1874,11 +1975,15 @@ class HermesCLI:
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
             fast_label = "⚡ fast" if self._fast_mode_active() else None
+            background_count = int(snapshot.get("background_tasks") or 0)
+            background_label = f"bg {background_count}" if background_count else ""
 
             if width < 52:
                 parts = [f"⚕ {snapshot['model_short']}"]
                 if fast_label:
                     parts.append(fast_label)
+                if background_label:
+                    parts.append(background_label)
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
             if width < 76:
@@ -1886,6 +1991,8 @@ class HermesCLI:
                 if fast_label:
                     parts.append(fast_label)
                 parts.append(percent_label)
+                if background_label:
+                    parts.append(background_label)
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
@@ -1899,7 +2006,10 @@ class HermesCLI:
             parts = [f"⚕ {snapshot['model_short']}"]
             if fast_label:
                 parts.append(fast_label)
-            parts.extend([context_label, percent_label, duration_label])
+            parts.extend([context_label, percent_label])
+            if background_label:
+                parts.append(background_label)
+            parts.append(duration_label)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2757,6 +2867,8 @@ class HermesCLI:
                 width = shutil.get_terminal_size((80, 24)).columns
             duration_label = snapshot["duration"]
             fast_label = "⚡ fast" if self._fast_mode_active() else None
+            background_count = int(snapshot.get("background_tasks") or 0)
+            background_label = f"bg {background_count}" if background_count else ""
 
             if width < 52:
                 frags = [
@@ -2767,6 +2879,11 @@ class HermesCLI:
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-fast-key", fast_label),
+                    ])
+                if background_label:
+                    frags.extend([
+                        ("class:status-bar-dim", " · "),
+                        ("class:status-bar-warn", background_label),
                     ])
                 frags.extend([
                     ("class:status-bar-dim", " · "),
@@ -2789,6 +2906,13 @@ class HermesCLI:
                     frags.extend([
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
+                    ])
+                    if background_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            ("class:status-bar-warn", background_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
@@ -2818,6 +2942,13 @@ class HermesCLI:
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
+                    ])
+                    if background_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            ("class:status-bar-warn", background_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
@@ -5054,6 +5185,408 @@ class HermesCLI:
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
 
+    def _handle_spawn_command(self, cmd: str):
+        """Handle /spawn <prompt> — run a prompt in a child session clone."""
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /spawn <prompt>")
+            _cprint("  Example: /spawn Continue this research in the background")
+            _cprint("  Clones the current session, keeps you here, and runs the prompt in the child.")
+            return
+
+        if not self.conversation_history:
+            _cprint("  No conversation to spawn from — send a message first.")
+            return
+
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start spawn task: no valid credentials.")
+            return
+
+        prompt = parts[1].strip()
+        history_snapshot = list(self.conversation_history)
+        parent_session_id = self.session_id
+        now = datetime.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        current_title = self._session_db.get_session_title(parent_session_id)
+        base_title = current_title or "spawn"
+        child_title = self._session_db.get_next_title_in_lineage(base_title)
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
+                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=None,
+                model_config={
+                    "max_iterations": self.max_turns,
+                    "reasoning_config": self.reasoning_config,
+                },
+                parent_session_id=parent_session_id,
+                title=child_title,
+                messages=history_snapshot,
+            )
+        except Exception as e:
+            _cprint(f"  Failed to create spawn session: {e}")
+            return
+
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"spawn_{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        _cprint(f'  🪄 Spawn task #{task_num} started: "{preview}"')
+        _cprint(f"  Task ID:         {task_id}")
+        _cprint(f"  Parent session:  {parent_session_id}")
+        _cprint(f"  Child session:   {new_session_id}")
+        _cprint("  You stay on the current session — results will appear here when done.")
+        self._show_background_agent_count_note(extra_tasks=1)
+        _cprint("")
+
+        turn_route = self._resolve_turn_agent_config(prompt)
+        clarify_callback = self._make_background_clarify_callback(f"spawn #{task_num}")
+
+        def run_spawn():
+            try:
+                spawn_agent = AIAgent(
+                    model=turn_route["model"],
+                    api_key=turn_route["runtime"].get("api_key"),
+                    base_url=turn_route["runtime"].get("base_url"),
+                    provider=turn_route["runtime"].get("provider"),
+                    api_mode=turn_route["runtime"].get("api_mode"),
+                    acp_command=turn_route["runtime"].get("command"),
+                    acp_args=turn_route["runtime"].get("args"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=new_session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                    clarify_callback=clarify_callback,
+                )
+                spawn_agent._print_fn = lambda *_a, **_kw: None
+
+                def _spawn_thinking(text: str) -> None:
+                    if not self._agent_running:
+                        self._spinner_text = text
+                        if self._app:
+                            self._app.invalidate()
+
+                spawn_agent.thinking_callback = _spawn_thinking
+                result = spawn_agent.run_conversation(
+                    user_message=prompt,
+                    conversation_history=history_snapshot,
+                    task_id=task_id,
+                )
+
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                _cprint(f"  ✅ Spawn task #{task_num} complete")
+                _cprint(f"  Prompt: \"{preview}\"")
+                _cprint(f"  Child session: {new_session_id}")
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                if response:
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _skin = get_active_skin()
+                        label = _skin.get_branding("response_label", "⚕ Hermes")
+                        _resp_color = _skin.get_color("response_border", "#CD7F32")
+                        _resp_text = _skin.get_color("banner_text", "#FFF8DC")
+                    except Exception:
+                        label = "⚕ Hermes"
+                        _resp_color = "#CD7F32"
+                        _resp_text = "#FFF8DC"
+
+                    _chat_console = ChatConsole()
+                    _chat_console.print(Panel(
+                        _rich_text_from_ansi(response),
+                        title=f"[{_resp_color} bold]{label} (spawn #{task_num})[/]",
+                        title_align="left",
+                        border_style=_resp_color,
+                        style=_resp_text,
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 2),
+                    ))
+                else:
+                    _cprint("  (No response generated)")
+
+                if self.bell_on_complete:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                _cprint(f"  ❌ Spawn task #{task_num} failed: {e}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if not self._agent_running:
+                    self._spinner_text = ""
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(target=run_spawn, daemon=True, name=f"spawn-task-{task_id}")
+        self._background_tasks[task_id] = thread
+        thread.start()
+
+    def _build_hermes_addition_prompt(
+        self,
+        prompt: str,
+        *,
+        worktree_info: Dict[str, str],
+        push_remote: str,
+        base_ref: str,
+    ) -> str:
+        base_branch = base_ref.split("/", 1)[1] if "/" in base_ref else base_ref
+        worktree_path = worktree_info["path"]
+        branch_name = worktree_info["branch"]
+        repo_root = worktree_info["repo_root"]
+        instructions = textwrap.dedent(
+            f"""
+            [Hermes Addition background PR agent]
+            You are running in a background child session cloned from the parent conversation.
+
+            Isolated coding workspace:
+            - repo root: {repo_root}
+            - worktree: {worktree_path}
+            - branch: {branch_name}
+            - preferred push remote: {push_remote}
+            - base branch: {base_branch}
+
+            Required workflow:
+            1. Do repo-changing terminal and file operations only inside {worktree_path}.
+               Use terminal(..., workdir={worktree_path!r}) and file paths rooted in that worktree.
+            2. Implement the requested change, run relevant tests, and fix failures before finishing.
+            3. If you need input from the user, call the clarify tool. The parent CLI will surface it in a kitty overlay when available.
+            4. When the work is ready, commit it, push the branch to {push_remote}, and open a pull request with gh.
+               Suggested commands:
+               - git status --short
+               - git add -A
+               - git commit -m "..."
+               - git push {push_remote} HEAD
+               - gh pr create --base {base_branch} --fill
+            5. Final response must include a concise status block with:
+               - Worktree
+               - Branch
+               - Tests
+               - Commit
+               - PR
+               - Any blocker
+
+            User request:
+            {prompt}
+            """
+        ).strip()
+        return instructions
+
+    def _handle_hermes_addition_command(self, cmd: str):
+        """Handle /hermes-addition <prompt> — spawn a PR-oriented background worktree agent."""
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /hermes-addition <prompt>")
+            _cprint("  Example: /hermes-addition Fix the flaky retry path and open a PR")
+            _cprint("  Creates an isolated git worktree, spawns a background child session, and aims for a PR on your fork.")
+            return
+
+        if not self.conversation_history:
+            _cprint("  No conversation to spawn from — send a message first.")
+            return
+
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start /hermes-addition: no valid credentials.")
+            return
+
+        prompt = parts[1].strip()
+        repo_root = _git_repo_root()
+        if not repo_root:
+            _cprint("  /hermes-addition requires a git repo in the active terminal cwd.")
+            return
+
+        worktree_info = _setup_worktree(repo_root=repo_root)
+        if not worktree_info:
+            _cprint("  Failed to create an isolated worktree for /hermes-addition.")
+            return
+
+        history_snapshot = list(self.conversation_history)
+        parent_session_id = self.session_id
+        now = datetime.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        current_title = self._session_db.get_session_title(parent_session_id)
+        child_title = self._session_db.get_next_title_in_lineage(current_title or "hermes-addition")
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
+                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=None,
+                model_config={
+                    "max_iterations": self.max_turns,
+                    "reasoning_config": self.reasoning_config,
+                },
+                parent_session_id=parent_session_id,
+                title=child_title,
+                messages=history_snapshot,
+            )
+        except Exception as e:
+            _cprint(f"  Failed to create /hermes-addition session: {e}")
+            return
+
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"addition_{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        push_remote = "fork" if _git_remote_exists(repo_root, "fork") else "origin"
+        base_ref = _git_default_base_ref(repo_root, "origin")
+        addition_prompt = self._build_hermes_addition_prompt(
+            prompt,
+            worktree_info=worktree_info,
+            push_remote=push_remote,
+            base_ref=base_ref,
+        )
+        clarify_callback = self._make_background_clarify_callback(f"hermes-addition #{task_num}")
+        _cprint(f'  🚀 Hermes Addition #{task_num} started: "{preview}"')
+        _cprint(f"  Task ID:         {task_id}")
+        _cprint(f"  Parent session:  {parent_session_id}")
+        _cprint(f"  Child session:   {new_session_id}")
+        _cprint(f"  Worktree:        {worktree_info['path']}")
+        _cprint(f"  Branch:          {worktree_info['branch']}")
+        _cprint(f"  Push remote:     {push_remote}")
+        _cprint("  Results will appear here when done.")
+        self._show_background_agent_count_note(extra_tasks=1)
+        _cprint("")
+
+        turn_route = self._resolve_turn_agent_config(prompt)
+
+        def run_addition():
+            try:
+                addition_agent = AIAgent(
+                    model=turn_route["model"],
+                    api_key=turn_route["runtime"].get("api_key"),
+                    base_url=turn_route["runtime"].get("base_url"),
+                    provider=turn_route["runtime"].get("provider"),
+                    api_mode=turn_route["runtime"].get("api_mode"),
+                    acp_command=turn_route["runtime"].get("command"),
+                    acp_args=turn_route["runtime"].get("args"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=new_session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                    clarify_callback=clarify_callback,
+                )
+                addition_agent._print_fn = lambda *_a, **_kw: None
+
+                def _addition_thinking(text: str) -> None:
+                    if not self._agent_running:
+                        self._spinner_text = text
+                        if self._app:
+                            self._app.invalidate()
+
+                addition_agent.thinking_callback = _addition_thinking
+                result = addition_agent.run_conversation(
+                    user_message=addition_prompt,
+                    conversation_history=history_snapshot,
+                    task_id=task_id,
+                )
+
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                _cprint(f"  ✅ Hermes Addition #{task_num} complete")
+                _cprint(f"  Prompt: \"{preview}\"")
+                _cprint(f"  Worktree: {worktree_info['path']}")
+                _cprint(f"  Branch:   {worktree_info['branch']}")
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                if response:
+                    _chat_console = ChatConsole()
+                    _chat_console.print(Panel(
+                        _rich_text_from_ansi(response),
+                        title=f"[{_accent_hex()} bold]⚕ Hermes (hermes-addition #{task_num})[/]",
+                        title_align="left",
+                        border_style=_accent_hex(),
+                        style="#FFF8DC",
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 2),
+                    ))
+                else:
+                    _cprint("  (No response generated)")
+
+                if self.bell_on_complete:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                _cprint(f"  ❌ Hermes Addition #{task_num} failed: {e}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if not self._agent_running:
+                    self._spinner_text = ""
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(target=run_addition, daemon=True, name=f"hermes-addition-{task_id}")
+        self._background_tasks[task_id] = thread
+        thread.start()
+
+    def reset_conversation(self):
+        """Reset the conversation by starting a new session."""
+        # Shut down memory provider before resetting — actual session boundary
+        if hasattr(self, 'agent') and self.agent:
+            self.agent.shutdown_memory_provider(self.conversation_history)
+        self.new_session()
+
     def save_conversation(self):
         """Save the current conversation to a file."""
         if not self.conversation_history:
@@ -5937,6 +6470,10 @@ class HermesCLI:
             self.undo_last()
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "spawn":
+            self._handle_spawn_command(cmd_original)
+        elif canonical == "hermes-addition":
+            self._handle_hermes_addition_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":
@@ -6178,20 +6715,24 @@ class HermesCLI:
             return
 
         prompt = parts[1].strip()
-        self._background_task_counter += 1
-        task_num = self._background_task_counter
-        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
         # Make sure we have valid credentials
         if not self._ensure_runtime_credentials():
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
             return
 
-        _cprint(f"  🔄 Background task #{task_num} started: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        _cprint(f'  🔄 Background task #{task_num} started: "{preview}"')
         _cprint(f"  Task ID: {task_id}")
-        _cprint("  You can continue chatting — results will appear when done.\n")
+        _cprint("  You can continue chatting — results will appear when done.")
+        self._show_background_agent_count_note(extra_tasks=1)
+        _cprint("")
 
         turn_route = self._resolve_turn_agent_config(prompt)
+        clarify_callback = self._make_background_clarify_callback(f"background #{task_num}")
 
         def run_background():
             try:
@@ -6219,6 +6760,7 @@ class HermesCLI:
                     provider_require_parameters=self._provider_require_params,
                     provider_data_collection=self._provider_data_collection,
                     fallback_model=self._fallback_model,
+                    clarify_callback=clarify_callback,
                 )
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
