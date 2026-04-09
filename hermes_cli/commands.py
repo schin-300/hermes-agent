@@ -63,6 +63,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("fork",), args_hint="[name]"),
     CommandDef("spawn", "Spawn a background child session from the current context", "Session",
                args_hint="<prompt>"),
+    CommandDef("hermes-addition", "Spawn a background worktree agent that prepares a PR on your fork", "Session",
+               cli_only=True, args_hint="<prompt>"),
     CommandDef("compress", "Manually compress conversation context", "Session"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
