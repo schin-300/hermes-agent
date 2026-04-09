@@ -2973,12 +2973,12 @@ class HermesCLI:
         # run() for immediate display).  In that case, conversation_history
         # is non-empty and we skip the DB round-trip.
         if self._resumed and self._session_db and not self.conversation_history:
-            session_meta = self._session_db.get_session(self.session_id)
+            session_meta = self._get_or_recover_session_meta(self.session_id)
             if not session_meta:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
                 _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
                 return False
-            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            restored = self._restore_session_from_db_or_log(self.session_id, session_meta=session_meta)
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
                 restored = self._dedupe_todo_snapshot_messages(restored)
@@ -3177,13 +3177,247 @@ class HermesCLI:
 
         self.console.print()
 
+    def _session_log_path(self, session_id: Optional[str] = None) -> Optional[Path]:
+        """Return the raw JSON session log path for a session ID."""
+        resolved_session_id = str(
+            session_id
+            or getattr(self, "session_id", "")
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        ).strip()
+        if not resolved_session_id:
+            return None
+        return _hermes_home / "sessions" / f"session_{resolved_session_id}.json"
+
+    def _load_session_log_entry(self, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Load a raw JSON session log entry if it exists and parses cleanly."""
+        log_path = self._session_log_path(session_id)
+        if not log_path or not log_path.exists():
+            return None
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("Failed to read session log %s: %s", log_path, exc)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _load_session_log_messages(self, session_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        """Load message history from the raw JSON session log."""
+        entry = self._load_session_log_entry(session_id)
+        if not entry:
+            return []
+        messages = entry.get("messages")
+        if not isinstance(messages, list):
+            return []
+        return [msg for msg in messages if isinstance(msg, dict)]
+
+    @staticmethod
+    def _session_message_signature(message: Dict[str, Any]) -> str:
+        """Normalize a conversation message for resume-prefix comparisons."""
+        normalized: Dict[str, Any] = {
+            "role": message.get("role"),
+        }
+        for key in (
+            "content",
+            "tool_call_id",
+            "tool_name",
+            "tool_calls",
+            "reasoning",
+            "reasoning_details",
+            "codex_reasoning_items",
+        ):
+            if key in message and message.get(key) is not None:
+                normalized[key] = message.get(key)
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _session_log_extends_conversation(
+        self,
+        existing_messages: list[Dict[str, Any]],
+        candidate_messages: list[Dict[str, Any]],
+    ) -> bool:
+        """Return True when candidate_messages starts with existing_messages."""
+        if len(existing_messages) > len(candidate_messages):
+            return False
+        for idx, existing in enumerate(existing_messages):
+            if self._session_message_signature(existing) != self._session_message_signature(candidate_messages[idx]):
+                return False
+        return True
+
+    @staticmethod
+    def _coerce_session_db_content(content: Any) -> Any:
+        """Serialize structured content so SQLite can store it safely."""
+        if content is None or isinstance(content, str):
+            return content
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+
+    def _append_messages_to_session_db(
+        self,
+        session_id: str,
+        messages: list[Dict[str, Any]],
+        start_idx: int = 0,
+        *,
+        session_meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Append trailing conversation messages into SQLite without duplicating rows."""
+        if not self._session_db or not messages or start_idx >= len(messages):
+            return 0
+
+        meta = session_meta or self._session_db.get_session(session_id) or {}
+        try:
+            self._session_db.ensure_session(
+                session_id,
+                source=meta.get("source") or meta.get("platform") or "cli",
+                model=meta.get("model") or getattr(getattr(self, "agent", None), "model", None) or getattr(self, "model", None),
+            )
+        except Exception as exc:
+            logger.warning("Could not ensure session row for %s before backfill: %s", session_id, exc)
+            return 0
+
+        appended = 0
+        for msg in messages[start_idx:]:
+            if not isinstance(msg, dict):
+                continue
+            try:
+                self._session_db.append_message(
+                    session_id=session_id,
+                    role=msg.get("role", "unknown"),
+                    content=self._coerce_session_db_content(msg.get("content")),
+                    tool_name=msg.get("tool_name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if msg.get("role") == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if msg.get("role") == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if msg.get("role") == "assistant" else None,
+                )
+                appended += 1
+            except Exception as exc:
+                logger.warning("Session DB append_message backfill failed for %s: %s", session_id, exc)
+                break
+        return appended
+
+    def _get_or_recover_session_meta(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch session metadata, recovering a minimal row from the raw log if needed."""
+        if not self._session_db:
+            return None
+        meta = self._session_db.get_session(session_id)
+        if meta:
+            return meta
+
+        log_entry = self._load_session_log_entry(session_id)
+        if not log_entry:
+            return None
+
+        try:
+            self._session_db.ensure_session(
+                session_id,
+                source=log_entry.get("platform") or "cli",
+                model=log_entry.get("model") or getattr(self, "model", None),
+            )
+        except Exception as exc:
+            logger.warning("Could not recover session row for %s from raw log: %s", session_id, exc)
+
+        return self._session_db.get_session(session_id) or {
+            "id": session_id,
+            "title": None,
+            "source": log_entry.get("platform") or "cli",
+            "model": log_entry.get("model") or getattr(self, "model", None),
+        }
+
+    def _restore_session_from_db_or_log(
+        self,
+        session_id: str,
+        *,
+        session_meta: Optional[Dict[str, Any]] = None,
+    ) -> list[Dict[str, Any]]:
+        """Restore the freshest transcript, preferring a newer raw JSON session log."""
+        if not self._session_db:
+            return []
+
+        db_messages = self._session_db.get_messages_as_conversation(session_id)
+        log_messages = self._load_session_log_messages(session_id)
+        if not log_messages:
+            return db_messages
+
+        if not db_messages:
+            appended = self._append_messages_to_session_db(
+                session_id,
+                log_messages,
+                session_meta=session_meta,
+            )
+            if appended:
+                logger.info("Recovered %d messages for %s from orphan raw session log", appended, session_id)
+            return log_messages
+
+        if len(log_messages) > len(db_messages):
+            if self._session_log_extends_conversation(db_messages, log_messages):
+                appended = self._append_messages_to_session_db(
+                    session_id,
+                    log_messages,
+                    start_idx=len(db_messages),
+                    session_meta=session_meta,
+                )
+                if appended:
+                    logger.info("Backfilled %d newer raw-log messages into SQLite for %s", appended, session_id)
+            else:
+                logger.warning(
+                    "Raw session log for %s is newer but diverges from SQLite; preferring raw log for resume",
+                    session_id,
+                )
+            return log_messages
+
+        return db_messages
+
+    def _persist_active_session_on_exit(self) -> int:
+        """Best-effort SQLite backfill from the freshest in-memory/raw transcript on exit."""
+        if not self._session_db:
+            return 0
+
+        session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", None)
+            or getattr(self, "session_id", None)
+            or ""
+        ).strip()
+        if not session_id:
+            return 0
+
+        session_meta = self._get_or_recover_session_meta(session_id)
+        db_messages = self._session_db.get_messages_as_conversation(session_id)
+        in_memory_messages = getattr(getattr(self, "agent", None), "_session_messages", None) or []
+        log_messages = self._load_session_log_messages(session_id)
+        candidates = [msgs for msgs in (in_memory_messages, log_messages) if isinstance(msgs, list) and msgs]
+        if not candidates:
+            return 0
+
+        latest_messages = max(candidates, key=len)
+        if db_messages and len(latest_messages) <= len(db_messages):
+            return 0
+        if db_messages and not self._session_log_extends_conversation(db_messages, latest_messages):
+            logger.warning(
+                "Skipping exit-time session DB backfill for %s: latest transcript diverges from SQLite",
+                session_id,
+            )
+            return 0
+
+        appended = self._append_messages_to_session_db(
+            session_id,
+            latest_messages,
+            start_idx=len(db_messages),
+            session_meta=session_meta,
+        )
+        if appended:
+            logger.info("Backfilled %d messages into SQLite during CLI shutdown for %s", appended, session_id)
+        return appended
+
     def _preload_resumed_session(self) -> bool:
-        """Load a resumed session's history from the DB early (before first chat).
+        """Load a resumed session's history from the freshest store before first chat.
 
         Called from run() so the conversation history is available for display
-        before the user sends their first message.  Sets
-        ``self.conversation_history`` and prints the one-liner status.  Returns
-        True if history was loaded, False otherwise.
+        before the user sends their first message.  Prefers the raw JSON session
+        log when SQLite is stale and backfills SQLite when possible.
 
         The corresponding block in ``_init_agent()`` checks whether history is
         already populated and skips the DB round-trip.
@@ -3191,7 +3425,7 @@ class HermesCLI:
         if not self._resumed or not self._session_db:
             return False
 
-        session_meta = self._session_db.get_session(self.session_id)
+        session_meta = self._get_or_recover_session_meta(self.session_id)
         if not session_meta:
             self.console.print(
                 f"[bold red]Session not found: {self.session_id}[/]"
@@ -3202,7 +3436,7 @@ class HermesCLI:
             )
             return False
 
-        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        restored = self._restore_session_from_db_or_log(self.session_id, session_meta=session_meta)
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
             restored = self._dedupe_todo_snapshot_messages(restored)
@@ -9416,8 +9650,13 @@ class HermesCLI:
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
-            # Close session in SQLite
+            # Backfill any raw/in-memory messages that never made it to SQLite,
+            # then close the session row.
             if hasattr(self, '_session_db') and self._session_db and self.agent:
+                try:
+                    self._persist_active_session_on_exit()
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug("Could not backfill active session state on exit: %s", e)
                 try:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:
