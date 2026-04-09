@@ -711,6 +711,18 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert agent._todo_store.has_items()
 
+    def test_recovers_from_operator_plan_snapshot(self, agent):
+        from tools.todo_tool import build_todo_snapshot_message
+
+        todos = [{"id": "review", "content": "Run reviewer", "status": "pending", "kind": "review_loop"}]
+        history = [
+            {"role": "user", "content": build_todo_snapshot_message(todos)},
+        ]
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+        assert agent._todo_store.has_items()
+        assert agent._todo_store.read()[0]["kind"] == "review_loop"
+
     def test_skips_non_todo_tools(self, agent):
         history = [
             {

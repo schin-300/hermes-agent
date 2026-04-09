@@ -20,6 +20,12 @@ from typing import Dict, Any, List, Optional
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+VALID_KINDS = {"task", "review_loop"}
+
+# Marker used when the operator updates the plan board directly from the CLI.
+# Stored as a normal user message so it survives resume/hydration without
+# requiring an assistant tool-call envelope.
+TODO_SNAPSHOT_MARKER = "[PLAN BOARD SNAPSHOT]"
 
 
 class TodoStore:
@@ -30,6 +36,7 @@ class TodoStore:
       - id: unique string identifier (agent-chosen)
       - content: task description
       - status: pending | in_progress | completed | cancelled
+      - optional metadata such as kind / success_criteria / reviewer_profile
     """
 
     def __init__(self):
@@ -114,10 +121,24 @@ class TodoStore:
         if not active_items:
             return None
 
-        lines = ["[Your active task list was preserved across context compression]"]
+        lines = [
+            "[Your active task list was preserved across context compression]",
+            "Treat review_loop items as blocking: do not finish until their success criteria have been independently reviewed.",
+        ]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            kind = item.get("kind", "task")
+            suffix_parts = [item["status"]]
+            if kind != "task":
+                suffix_parts.append(kind)
+            criteria = str(item.get("success_criteria") or "").strip()
+            if criteria:
+                suffix_parts.append(f"criteria: {criteria}")
+            reviewer = str(item.get("reviewer_profile") or "").strip()
+            if reviewer:
+                suffix_parts.append(f"reviewer: {reviewer}")
+            suffix = "; ".join(suffix_parts)
+            lines.append(f"- {marker} {item['id']}. {item['content']} ({suffix})")
 
         return "\n".join(lines)
 
@@ -127,7 +148,7 @@ class TodoStore:
         Validate and normalize a todo item.
 
         Ensures required fields exist and status is valid.
-        Returns a clean dict with only {id, content, status}.
+        Returns a clean dict with stable optional metadata preserved.
         """
         item_id = str(item.get("id", "")).strip()
         if not item_id:
@@ -141,7 +162,41 @@ class TodoStore:
         if status not in VALID_STATUSES:
             status = "pending"
 
-        return {"id": item_id, "content": content, "status": status}
+        kind = str(item.get("kind", "task") or "task").strip().lower()
+        if kind not in VALID_KINDS:
+            kind = "task"
+
+        clean = {
+            "id": item_id,
+            "content": content,
+            "status": status,
+            "kind": kind,
+        }
+
+        optional_text_fields = (
+            "success_criteria",
+            "reviewer_profile",
+            "reviewer_prompt",
+        )
+        for key in optional_text_fields:
+            value = str(item.get(key, "") or "").strip()
+            if value:
+                clean[key] = value
+
+        attempt_count = item.get("attempt_count")
+        if attempt_count is not None:
+            try:
+                clean["attempt_count"] = max(0, int(attempt_count))
+            except (TypeError, ValueError):
+                pass
+
+        return clean
+
+
+def build_todo_snapshot_message(items: List[Dict[str, Any]]) -> str:
+    """Serialize a todo snapshot into a user-message marker for persistence."""
+    payload = json.dumps({"todos": items}, ensure_ascii=False)
+    return f"{TODO_SNAPSHOT_MARKER}\n{payload}"
 
 
 def todo_tool(
@@ -208,10 +263,15 @@ TODO_SCHEMA = {
         "- merge=false (default): replace the entire list with a fresh plan\n"
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
-        "status: pending|in_progress|completed|cancelled}\n"
+        "status: pending|in_progress|completed|cancelled, "
+        "kind?: task|review_loop, success_criteria?: string, "
+        "reviewer_profile?: string, reviewer_prompt?: string, attempt_count?: integer}\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
         "Mark items completed immediately when done. If something fails, "
-        "cancel it and add a revised item.\n\n"
+        "cancel it and add a revised item.\n"
+        "review_loop items are blocking gates: they stay active until the work "
+        "has been independently reviewed against success_criteria. Prefer using "
+        "delegate_task for that reviewer pass when available.\n\n"
         "Always returns the full current list."
     ),
     "parameters": {
@@ -235,6 +295,27 @@ TODO_SCHEMA = {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
                             "description": "Current status"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["task", "review_loop"],
+                            "description": "Optional block type. review_loop means this item should not be marked complete until it passes an independent review."
+                        },
+                        "success_criteria": {
+                            "type": "string",
+                            "description": "Expected result or pass/fail criteria, especially for review_loop items."
+                        },
+                        "reviewer_profile": {
+                            "type": "string",
+                            "description": "Optional reviewer label/profile to use for a review_loop item."
+                        },
+                        "reviewer_prompt": {
+                            "type": "string",
+                            "description": "Optional reviewer instructions for a review_loop item."
+                        },
+                        "attempt_count": {
+                            "type": "integer",
+                            "description": "Optional count of implementation/review attempts for looping workflows."
                         }
                     },
                     "required": ["id", "content", "status"]
