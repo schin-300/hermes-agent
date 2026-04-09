@@ -5,9 +5,13 @@ Verifies that resuming a session shows a compact recap of the previous
 conversation with correct formatting, truncation, and config behavior.
 """
 
+import json
 import os
 import sys
+import tempfile
 from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -46,6 +50,27 @@ def _make_cli(config_overrides=None, env_overrides=None, **kwargs):
         patch.dict(_cli_mod.__dict__, {"CLI_CONFIG": _clean_config}),
     ):
         return HermesCLI(**kwargs)
+
+
+def _write_session_log(home: Path, session_id: str, messages: list[dict]) -> Path:
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"session_{session_id}.json"
+    log_path.write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "model": "test/model",
+                "platform": "cli",
+                "message_count": len(messages),
+                "messages": messages,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return log_path
 
 
 # ── Sample conversation histories for tests ──────────────────────────
@@ -434,6 +459,105 @@ class TestPreloadResumedSession:
         output = buf.getvalue()
         assert "1 user message," in output
         assert "1 user messages" not in output
+
+    def test_prefers_newer_raw_session_log_and_backfills_sqlite(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_home = Path(tmpdir)
+            db = SessionDB(db_path=temp_home / "state.db")
+            session_id = "resume_from_raw_log"
+            db.create_session(session_id=session_id, source="cli", model="test/model")
+            db.append_message(session_id, "user", "hello")
+            db.append_message(session_id, "assistant", "partial")
+
+            raw_messages = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "partial"},
+                {"role": "user", "content": "follow up"},
+                {"role": "assistant", "content": "latest answer"},
+            ]
+            _write_session_log(temp_home, session_id, raw_messages)
+
+            cli = _make_cli(resume=session_id)
+            cli._session_db = db
+            buf = StringIO()
+            cli.console.file = buf
+
+            with patch("cli._hermes_home", temp_home):
+                result = cli._preload_resumed_session()
+
+            assert result is True
+            assert cli.conversation_history == raw_messages
+            assert db.get_messages_as_conversation(session_id) == raw_messages
+            output = buf.getvalue()
+            assert "2 user messages" in output
+            assert "4 total messages" in output
+
+    def test_recovers_orphan_raw_session_log_into_sqlite(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_home = Path(tmpdir)
+            db = SessionDB(db_path=temp_home / "state.db")
+            session_id = "orphan_raw_log"
+
+            raw_messages = [
+                {"role": "user", "content": "hello from raw log"},
+                {"role": "assistant", "content": "restored from raw log"},
+            ]
+            _write_session_log(temp_home, session_id, raw_messages)
+
+            cli = _make_cli(resume=session_id)
+            cli._session_db = db
+            buf = StringIO()
+            cli.console.file = buf
+
+            with patch("cli._hermes_home", temp_home):
+                result = cli._preload_resumed_session()
+
+            assert result is True
+            assert cli.conversation_history == raw_messages
+            assert db.get_messages_as_conversation(session_id) == raw_messages
+
+
+class TestPersistActiveSessionOnExit:
+    def test_backfills_sqlite_from_newer_raw_log_on_exit(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_home = Path(tmpdir)
+            db = SessionDB(db_path=temp_home / "state.db")
+            session_id = "exit_backfill"
+            db.create_session(session_id=session_id, source="cli", model="test/model")
+            db.append_message(session_id, "user", "hello")
+            db.append_message(session_id, "assistant", "partial")
+
+            raw_messages = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "partial"},
+                {"role": "user", "content": "follow up"},
+                {"role": "assistant", "content": "saved on exit"},
+            ]
+            _write_session_log(temp_home, session_id, raw_messages)
+
+            cli = _make_cli()
+            cli.session_id = session_id
+            cli._session_db = db
+            cli.agent = SimpleNamespace(
+                session_id=session_id,
+                model="test/model",
+                platform="cli",
+                _session_messages=[
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "partial"},
+                ],
+            )
+
+            with patch("cli._hermes_home", temp_home):
+                cli._persist_active_session_on_exit()
+
+            assert db.get_messages_as_conversation(session_id) == raw_messages
 
 
 # ── Integration: _init_agent skips when preloaded ────────────────────
