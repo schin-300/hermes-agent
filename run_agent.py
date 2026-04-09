@@ -2895,22 +2895,35 @@ class AIAgent:
         TodoStore is empty. We scan the history for the most recent todo
         tool response and replay it to reconstruct the state.
         """
-        # Walk history backwards to find the most recent todo tool response
+        from tools.todo_tool import TODO_SNAPSHOT_MARKER
+
+        # Walk history backwards to find the most recent todo tool response or
+        # operator-authored plan-board snapshot.
         last_todo_response = None
         for msg in reversed(history):
-            if msg.get("role") != "tool":
-                continue
             content = msg.get("content", "")
-            # Quick check: todo responses contain "todos" key
-            if '"todos"' not in content:
-                continue
-            try:
-                data = json.loads(content)
-                if "todos" in data and isinstance(data["todos"], list):
-                    last_todo_response = data["todos"]
-                    break
-            except (json.JSONDecodeError, TypeError):
-                continue
+            if not isinstance(content, str) or '"todos"' not in content:
+                if not (isinstance(content, str) and content.startswith(TODO_SNAPSHOT_MARKER)):
+                    continue
+
+            if msg.get("role") == "tool":
+                try:
+                    data = json.loads(content)
+                    if "todos" in data and isinstance(data["todos"], list):
+                        last_todo_response = data["todos"]
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            if msg.get("role") == "user" and content.startswith(TODO_SNAPSHOT_MARKER):
+                payload = content[len(TODO_SNAPSHOT_MARKER):].strip()
+                try:
+                    data = json.loads(payload)
+                    if "todos" in data and isinstance(data["todos"], list):
+                        last_todo_response = data["todos"]
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    continue
         
         if last_todo_response:
             # Replay the items into the store (replace mode)

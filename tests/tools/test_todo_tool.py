@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TodoStore, todo_tool, build_todo_snapshot_message, TODO_SNAPSHOT_MARKER
 
 
 class TestWriteAndRead:
@@ -23,6 +23,25 @@ class TestWriteAndRead:
         items = store.read()
         items[0]["content"] = "MUTATED"
         assert store.read()[0]["content"] == "Task"
+
+    def test_preserves_review_loop_metadata(self):
+        store = TodoStore()
+        store.write([
+            {
+                "id": "review",
+                "content": "Review popup",
+                "status": "pending",
+                "kind": "review_loop",
+                "success_criteria": "Popup persists edits.",
+                "reviewer_profile": "gpt-5.4 reviewer",
+                "attempt_count": 2,
+            }
+        ])
+        item = store.read()[0]
+        assert item["kind"] == "review_loop"
+        assert item["success_criteria"] == "Popup persists edits."
+        assert item["reviewer_profile"] == "gpt-5.4 reviewer"
+        assert item["attempt_count"] == 2
 
 
 class TestHasItems:
@@ -45,7 +64,14 @@ class TestFormatForInjection:
         store = TodoStore()
         store.write([
             {"id": "1", "content": "Do thing", "status": "completed"},
-            {"id": "2", "content": "Next", "status": "pending"},
+            {
+                "id": "2",
+                "content": "Next",
+                "status": "pending",
+                "kind": "review_loop",
+                "success_criteria": "Popup passes review",
+                "reviewer_profile": "gpt-5.4 reviewer",
+            },
             {"id": "3", "content": "Working", "status": "in_progress"},
         ])
         text = store.format_for_injection()
@@ -57,6 +83,9 @@ class TestFormatForInjection:
         assert "[>]" in text
         assert "Next" in text
         assert "Working" in text
+        assert "review_loop" in text
+        assert "criteria: Popup passes review" in text
+        assert "reviewer: gpt-5.4 reviewer" in text
         assert "context compression" in text.lower()
 
 
@@ -84,6 +113,16 @@ class TestMergeMode:
         )
         items = store.read()
         assert len(items) == 2
+
+
+class TestSnapshotMessage:
+    def test_build_todo_snapshot_message_has_marker(self):
+        text = build_todo_snapshot_message([
+            {"id": "1", "content": "Task", "status": "pending", "kind": "task"}
+        ])
+        assert text.startswith(TODO_SNAPSHOT_MARKER)
+        data = json.loads(text.split("\n", 1)[1])
+        assert data["todos"][0]["content"] == "Task"
 
 
 class TestTodoToolFunction:

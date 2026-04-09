@@ -22,6 +22,7 @@ import atexit
 import tempfile
 import time
 import uuid
+import re
 import textwrap
 from contextlib import contextmanager
 from pathlib import Path
@@ -1578,6 +1579,11 @@ class HermesCLI:
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
+        self._todo_plan_signature = ""
+        self._todo_plan_updated_at = 0.0
+        self._todo_plan_refresh_timer = None
+        self._local_todo_store = None
+        self._plan_popup_state = None
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
@@ -1748,6 +1754,567 @@ class HermesCLI:
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
+
+    def _get_todo_store(self):
+        agent = getattr(self, "agent", None)
+        store = getattr(agent, "_todo_store", None)
+        if store is not None:
+            return store
+
+        self._hydrate_local_todo_store_from_history()
+        store = getattr(self, "_local_todo_store", None)
+        if store is not None:
+            return store
+        try:
+            from tools.todo_tool import TodoStore
+            store = TodoStore()
+            self._local_todo_store = store
+            return store
+        except Exception:
+            return None
+
+    def _get_todo_items(self) -> list[Dict[str, str]]:
+        """Return the current session todo items, if any."""
+        store = self._get_todo_store()
+        if not store:
+            return []
+        try:
+            items = store.read()
+        except Exception:
+            return []
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    def _todo_plan_recently_updated(self, now: Optional[float] = None) -> bool:
+        updated_at = float(getattr(self, "_todo_plan_updated_at", 0.0) or 0.0)
+        if not updated_at:
+            return False
+        if now is None:
+            import time as _time
+            now = _time.monotonic()
+        return (now - updated_at) < 12.0
+
+    def _mark_todo_plan_updated(self, items: list[Dict[str, str]]) -> None:
+        try:
+            signature = json.dumps(items, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            signature = repr(items)
+        if signature != getattr(self, "_todo_plan_signature", ""):
+            self._todo_plan_signature = signature
+            import time as _time
+            self._todo_plan_updated_at = _time.monotonic()
+
+            timer = getattr(self, "_todo_plan_refresh_timer", None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+                self._todo_plan_refresh_timer = None
+
+            if getattr(self, "_app", None):
+                try:
+                    timer = threading.Timer(12.1, lambda: self._invalidate(min_interval=0))
+                    timer.daemon = True
+                    timer.start()
+                    self._todo_plan_refresh_timer = timer
+                except Exception:
+                    self._todo_plan_refresh_timer = None
+
+    def _fit_display_line(self, text: str, width: int) -> str:
+        width = max(1, int(width or 0))
+        if self._status_bar_display_width(text) <= width:
+            return text
+        return self._trim_status_bar_text(text, width)
+
+    def _wrap_display_text(
+        self,
+        text: str,
+        width: int,
+        *,
+        initial_indent: str = "",
+        subsequent_indent: Optional[str] = None,
+    ) -> list[str]:
+        normalized = " ".join(str(text or "").split())
+        wrap_width = max(1, int(width or 0))
+        if not normalized:
+            return []
+        wrapped = textwrap.wrap(
+            normalized,
+            width=wrap_width,
+            initial_indent=initial_indent,
+            subsequent_indent=subsequent_indent if subsequent_indent is not None else initial_indent,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [f"{initial_indent}{normalized}"]
+        return [self._fit_display_line(line, wrap_width) for line in wrapped]
+
+    @staticmethod
+    def _todo_kind_label(item: Dict[str, str]) -> str:
+        kind = str(item.get("kind") or "task").strip().lower()
+        return "review-loop" if kind == "review_loop" else "task"
+
+    @staticmethod
+    def _todo_status_marker(item: Dict[str, str]) -> str:
+        status = str(item.get("status") or "pending")
+        return {
+            "completed": "☒",
+            "in_progress": "☐",
+            "pending": "☐",
+            "cancelled": "⊘",
+        }.get(status, "☐")
+
+    def _build_todo_plan_summary(self, items: list[Dict[str, str]]) -> str:
+        total = len(items)
+        completed = sum(1 for item in items if item.get("status") == "completed")
+        cancelled = sum(1 for item in items if item.get("status") == "cancelled")
+        current = next((item for item in items if item.get("status") == "in_progress"), None)
+        next_pending = next((item for item in items if item.get("status") == "pending"), None)
+
+        if current:
+            content = str(current.get("content") or current.get("id") or "(no description)").strip()
+            return f"Current focus: {content} ({completed}/{total} done)"
+        if next_pending:
+            content = str(next_pending.get("content") or next_pending.get("id") or "(no description)").strip()
+            opener = "Next up" if completed or cancelled else "Starting with"
+            return f"{opener}: {content} ({completed}/{total} done)"
+        if completed == total:
+            return f"All planned steps are complete ({completed}/{total} done)."
+        if cancelled == total:
+            noun = "step" if cancelled == 1 else "steps"
+            return f"The current plan was cancelled ({cancelled} {noun})."
+        return f"Plan closed: {completed}/{total} done · {cancelled} cancelled"
+
+    def _build_todo_plan_lines(self, width: Optional[int] = None) -> list[tuple[str, str]]:
+        try:
+            items = self._get_todo_items()
+            if not items:
+                return []
+
+            if width is None:
+                try:
+                    from prompt_toolkit.application import get_app
+                    width = get_app().output.get_size().columns
+                except Exception:
+                    width = shutil.get_terminal_size((80, 24)).columns
+
+            content_width = max(1, int(width or 0))
+            heading = "• Updated Plan" if self._todo_plan_recently_updated() else "• Current Plan"
+            lines: list[tuple[str, str]] = [
+                ("plan-heading", self._fit_display_line(heading, content_width))
+            ]
+
+            summary = self._build_todo_plan_summary(items)
+            for wrapped in self._wrap_display_text(
+                summary,
+                content_width,
+                initial_indent="  └ ",
+                subsequent_indent="    ",
+            ):
+                lines.append(("plan-summary", wrapped))
+
+            styles = {
+                "completed": "plan-done",
+                "in_progress": "plan-active",
+                "pending": "plan-pending",
+                "cancelled": "plan-cancelled",
+            }
+
+            max_visible_items = 6
+            visible_items = items[:max_visible_items]
+            for item in visible_items:
+                status = str(item.get("status") or "pending")
+                marker = self._todo_status_marker(item)
+                style = styles.get(status, "plan-pending")
+                kind_label = self._todo_kind_label(item)
+                content = str(item.get("content") or item.get("id") or "(no description)").strip()
+                row = f"[{kind_label}] {content}"
+                for wrapped in self._wrap_display_text(
+                    row,
+                    content_width,
+                    initial_indent=f"  {marker} ",
+                    subsequent_indent="    ",
+                ):
+                    lines.append((style, wrapped))
+
+            hidden_items = len(items) - len(visible_items)
+            if hidden_items > 0:
+                noun = "step" if hidden_items == 1 else "steps"
+                lines.append((
+                    "plan-summary",
+                    self._fit_display_line(f"  … +{hidden_items} more {noun}", content_width),
+                ))
+
+            max_rows = 8
+            if len(lines) > max_rows:
+                hidden_lines = len(lines) - (max_rows - 1)
+                lines = lines[: max_rows - 1] + [
+                    (
+                        "plan-summary",
+                        self._fit_display_line(f"  … +{hidden_lines} more lines", content_width),
+                    )
+                ]
+
+            return lines
+        except Exception:
+            return []
+
+    def _get_todo_plan_fragments(self):
+        """Return prompt_toolkit fragments for the inline plan widget."""
+        lines = self._build_todo_plan_lines()
+        if not lines:
+            return []
+
+        fragments = []
+        for index, (style, text) in enumerate(lines):
+            fragments.append((f"class:{style}", text))
+            if index < len(lines) - 1:
+                fragments.append(("", "\n"))
+        return fragments
+
+    def _get_todo_plan_height(self) -> int:
+        return len(self._build_todo_plan_lines())
+
+    def _build_plan_popup_lines(self, width: Optional[int] = None) -> list[tuple[str, str]]:
+        state = getattr(self, "_plan_popup_state", None) or {"selected": 0, "mode": "browse"}
+        if width is None:
+            try:
+                from prompt_toolkit.application import get_app
+                width = get_app().output.get_size().columns
+            except Exception:
+                width = shutil.get_terminal_size((80, 24)).columns
+        content_width = max(24, min(72, int(width or 0) - 8))
+        lines: list[tuple[str, str]] = []
+
+        mode = state.get("mode", "browse")
+        hint = {
+            "browse": "↑/↓ select · a add task · r add review loop · space done · i active · esc close",
+            "add_task": "Add task — type the row text below and press Enter",
+            "add_review": "Add review loop — title | success criteria | reviewer note(optional)",
+        }.get(mode, "esc close")
+        for wrapped in self._wrap_display_text(hint, content_width, initial_indent="", subsequent_indent="  "):
+            lines.append(("plan-popup-meta", wrapped))
+
+        items = self._get_todo_items()
+        if not items:
+            lines.append(("plan-popup-text", "(no plan blocks yet)"))
+            return lines
+
+        selected = max(0, min(int(state.get("selected", 0) or 0), len(items) - 1))
+        window_start = max(0, selected - 3)
+        visible = items[window_start:window_start + 7]
+        for absolute_idx, item in enumerate(visible, start=window_start):
+            prefix = "❯ " if absolute_idx == selected else "  "
+            marker = self._todo_status_marker(item)
+            row = f"{prefix}{marker} [{self._todo_kind_label(item)}] {str(item.get('content') or item.get('id') or '(no description)').strip()}"
+            style = "plan-popup-selected" if absolute_idx == selected else "plan-popup-text"
+            for wrapped in self._wrap_display_text(row, content_width, initial_indent="", subsequent_indent="   "):
+                lines.append((style, wrapped))
+
+        item = items[selected]
+        criteria = str(item.get("success_criteria") or "").strip()
+        reviewer = str(item.get("reviewer_profile") or "").strip()
+        if criteria:
+            for wrapped in self._wrap_display_text(f"Expected: {criteria}", content_width, initial_indent="", subsequent_indent="  "):
+                lines.append(("plan-popup-meta", wrapped))
+        if reviewer:
+            for wrapped in self._wrap_display_text(f"Reviewer: {reviewer}", content_width, initial_indent="", subsequent_indent="  "):
+                lines.append(("plan-popup-meta", wrapped))
+        return lines
+
+    def _build_plan_snapshot_message(self, items: list[Dict[str, str]]) -> Optional[str]:
+        try:
+            from tools.todo_tool import build_todo_snapshot_message
+            return build_todo_snapshot_message(items)
+        except Exception:
+            return None
+
+    def _is_todo_snapshot_message(self, message: Any) -> bool:
+        try:
+            from tools.todo_tool import TODO_SNAPSHOT_MARKER
+        except Exception:
+            TODO_SNAPSHOT_MARKER = "[PLAN BOARD SNAPSHOT]"
+        return (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message.get("content", "").startswith(TODO_SNAPSHOT_MARKER)
+        )
+
+    def _extract_latest_todo_snapshot_items(
+        self,
+        messages: Optional[list[Dict[str, Any]]] = None,
+    ) -> Optional[list[Dict[str, Any]]]:
+        history = messages if isinstance(messages, list) else getattr(self, "conversation_history", None)
+        if not isinstance(history, list):
+            return None
+
+        for message in reversed(history):
+            if not self._is_todo_snapshot_message(message):
+                continue
+            content = message.get("content")
+            payload = content.split("\n", 1)[1] if "\n" in content else ""
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return None
+            todos = data.get("todos")
+            if isinstance(todos, list):
+                return [item for item in todos if isinstance(item, dict)]
+            return None
+        return None
+
+    def _dedupe_todo_snapshot_messages(
+        self,
+        messages: list[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        try:
+            from tools.todo_tool import TODO_SNAPSHOT_MARKER
+        except Exception:
+            TODO_SNAPSHOT_MARKER = "[PLAN BOARD SNAPSHOT]"
+
+        latest_snapshot_idx = None
+        for idx, message in enumerate(messages):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+                and message.get("content", "").startswith(TODO_SNAPSHOT_MARKER)
+            ):
+                latest_snapshot_idx = idx
+
+        if latest_snapshot_idx is None:
+            return list(messages)
+
+        filtered = []
+        for idx, message in enumerate(messages):
+            is_snapshot = (
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+                and message.get("content", "").startswith(TODO_SNAPSHOT_MARKER)
+            )
+            if is_snapshot and idx != latest_snapshot_idx:
+                continue
+            filtered.append(message)
+        return filtered
+
+    def _hydrate_local_todo_store_from_history(
+        self,
+        messages: Optional[list[Dict[str, Any]]] = None,
+        *,
+        overwrite: bool = False,
+    ):
+        try:
+            from tools.todo_tool import TodoStore
+        except Exception:
+            return None
+
+        store = getattr(self, "_local_todo_store", None)
+        if store is None:
+            store = TodoStore()
+            self._local_todo_store = store
+
+        if not overwrite and getattr(store, "has_items", lambda: False)():
+            return store
+
+        snapshot_items = self._extract_latest_todo_snapshot_items(messages)
+        if snapshot_items is None:
+            return store
+
+        try:
+            store.write(snapshot_items, merge=False)
+        except Exception:
+            return store
+
+        self._mark_todo_plan_updated(store.read())
+        return store
+
+    def _persist_plan_snapshot(self, items: list[Dict[str, str]]) -> None:
+        snapshot_message = self._build_plan_snapshot_message(items)
+        if not snapshot_message:
+            return
+        try:
+            from tools.todo_tool import TODO_SNAPSHOT_MARKER
+        except Exception:
+            TODO_SNAPSHOT_MARKER = "[PLAN BOARD SNAPSHOT]"
+
+        history = getattr(self, "conversation_history", None)
+        if isinstance(history, list):
+            filtered = [
+                msg for msg in history
+                if not (
+                    isinstance(msg, dict)
+                    and msg.get("role") == "user"
+                    and isinstance(msg.get("content"), str)
+                    and msg.get("content", "").startswith(TODO_SNAPSHOT_MARKER)
+                )
+            ]
+            filtered.append({"role": "user", "content": snapshot_message})
+            self.conversation_history = filtered
+
+        if getattr(self, "_session_db", None) and getattr(self, "session_id", None):
+            try:
+                conn = getattr(self._session_db, "_conn", None)
+                if conn is not None:
+                    conn.execute(
+                        "DELETE FROM messages WHERE session_id = ? AND role = 'user' AND content LIKE ?",
+                        (self.session_id, f"{TODO_SNAPSHOT_MARKER}%"),
+                    )
+                    conn.commit()
+                self._session_db.append_message(
+                    session_id=self.session_id,
+                    role="user",
+                    content=snapshot_message,
+                )
+            except Exception:
+                pass
+
+    def _rewrite_plan_items(self, items: list[Dict[str, str]]) -> list[Dict[str, str]]:
+        store = self._get_todo_store()
+        if not store:
+            return []
+        try:
+            updated = store.write(items, merge=False)
+        except Exception:
+            return []
+        self._mark_todo_plan_updated(updated)
+        self._persist_plan_snapshot(updated)
+        self._invalidate(min_interval=0)
+        return updated
+
+    def _slugify_todo_id(self, content: str, prefix: str = "task") -> str:
+        base = re.sub(r"[^a-z0-9]+", "-", str(content or "").lower()).strip("-")[:24] or prefix
+        existing = {str(item.get("id") or "") for item in self._get_todo_items()}
+        candidate = base
+        suffix = 2
+        while candidate in existing:
+            candidate = f"{base[:20]}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def _ensure_plan_popup_state(self) -> dict:
+        state = getattr(self, "_plan_popup_state", None)
+        if not isinstance(state, dict):
+            state = {"selected": 0, "mode": "browse"}
+            self._plan_popup_state = state
+        items = self._get_todo_items()
+        if items:
+            state["selected"] = max(0, min(int(state.get("selected", 0) or 0), len(items) - 1))
+        else:
+            state["selected"] = 0
+        return state
+
+    def _toggle_plan_popup(self) -> None:
+        if getattr(self, "_plan_popup_state", None):
+            self._close_plan_popup()
+            return
+        self._plan_popup_state = {"selected": 0, "mode": "browse"}
+        self._invalidate(min_interval=0)
+        if getattr(self, "_app", None):
+            try:
+                self._app.current_buffer.reset()
+            except Exception:
+                pass
+
+    def _close_plan_popup(self) -> None:
+        self._plan_popup_state = None
+        if getattr(self, "_app", None):
+            try:
+                self._app.current_buffer.reset()
+            except Exception:
+                pass
+        self._invalidate(min_interval=0)
+
+    def _plan_popup_move_selection(self, delta: int) -> None:
+        state = self._ensure_plan_popup_state()
+        if state.get("mode") != "browse":
+            return
+        items = self._get_todo_items()
+        if not items:
+            return
+        selected = max(0, min(state.get("selected", 0) + delta, len(items) - 1))
+        state["selected"] = selected
+        self._invalidate(min_interval=0)
+
+    def _plan_popup_start_entry(self, mode: str) -> None:
+        state = self._ensure_plan_popup_state()
+        state["mode"] = mode
+        self._invalidate(min_interval=0)
+        if getattr(self, "_app", None):
+            try:
+                self._app.current_buffer.reset()
+            except Exception:
+                pass
+
+    def _plan_popup_set_selected_status(self, status: str) -> None:
+        state = self._ensure_plan_popup_state()
+        items = self._get_todo_items()
+        if not items:
+            return
+        selected = max(0, min(int(state.get("selected", 0) or 0), len(items) - 1))
+        updated = []
+        for idx, item in enumerate(items):
+            row = dict(item)
+            if idx == selected:
+                row["status"] = status
+            elif status == "in_progress" and row.get("status") == "in_progress":
+                row["status"] = "pending"
+            updated.append(row)
+        self._rewrite_plan_items(updated)
+
+    def _plan_popup_toggle_selected_completed(self) -> None:
+        items = self._get_todo_items()
+        state = self._ensure_plan_popup_state()
+        if not items:
+            return
+        selected = max(0, min(int(state.get("selected", 0) or 0), len(items) - 1))
+        next_status = "pending" if items[selected].get("status") == "completed" else "completed"
+        self._plan_popup_set_selected_status(next_status)
+
+    def _plan_popup_commit_entry(self, raw_text: str) -> bool:
+        state = self._ensure_plan_popup_state()
+        mode = state.get("mode", "browse")
+        text = str(raw_text or "").strip()
+        if mode not in {"add_task", "add_review"} or not text:
+            return False
+
+        items = self._get_todo_items()
+        if mode == "add_review":
+            parts = [part.strip() for part in text.split("|")]
+            title = parts[0] if parts else text
+            criteria = parts[1] if len(parts) > 1 and parts[1] else "Delivered work matches the requested behavior and passes an independent review."
+            reviewer_note = parts[2] if len(parts) > 2 and parts[2] else ""
+            item = {
+                "id": self._slugify_todo_id(title, prefix="review"),
+                "content": title or "Review loop",
+                "status": "pending",
+                "kind": "review_loop",
+                "success_criteria": criteria,
+                "reviewer_profile": "gpt-5.4 reviewer",
+            }
+            if reviewer_note:
+                item["reviewer_prompt"] = reviewer_note
+        else:
+            item = {
+                "id": self._slugify_todo_id(text, prefix="task"),
+                "content": text,
+                "status": "pending",
+                "kind": "task",
+            }
+
+        updated = list(items) + [item]
+        self._rewrite_plan_items(updated)
+        state["selected"] = len(updated) - 1
+        state["mode"] = "browse"
+        if getattr(self, "_app", None):
+            try:
+                self._app.current_buffer.reset()
+            except Exception:
+                pass
+        self._invalidate(min_interval=0)
+        return True
 
     def _get_status_bar_fragments(self):
         if not self._status_bar_visible:
@@ -2414,8 +2981,11 @@ class HermesCLI:
             restored = self._session_db.get_messages_as_conversation(self.session_id)
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
+                restored = self._dedupe_todo_snapshot_messages(restored)
                 self.conversation_history = restored
-                msg_count = len([m for m in restored if m.get("role") == "user"])
+                self._hydrate_local_todo_store_from_history(restored, overwrite=True)
+                visible_restored = [m for m in restored if not self._is_todo_snapshot_message(m)]
+                msg_count = len([m for m in visible_restored if m.get("role") == "user"])
                 title_part = ""
                 if session_meta.get("title"):
                     title_part = f" \"{session_meta['title']}\""
@@ -2423,7 +2993,7 @@ class HermesCLI:
                     f"[bold {_accent_hex()}]↻ Resumed session[/] "
                     f"[bold]{_escape(self.session_id)}[/]"
                     f"[bold {_accent_hex()}]{_escape(title_part)}[/] "
-                    f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(restored)} total messages)"
+                    f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(visible_restored)} total messages)"
                 )
             else:
                 ChatConsole().print(
@@ -2488,10 +3058,18 @@ class HermesCLI:
                 pass_session_id=self.pass_session_id,
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
+                tool_complete_callback=self._on_tool_complete,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
+            try:
+                local_store = getattr(self, "_local_todo_store", None)
+                if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
+                    seed_items = local_store.read()
+                    if seed_items and not self.agent._todo_store.has_items():
+                        self.agent._todo_store.write(seed_items, merge=False)
+            except Exception:
+                pass
             # Store reference for atexit memory provider shutdown
             global _active_agent_ref
             _active_agent_ref = self.agent
@@ -2627,8 +3205,11 @@ class HermesCLI:
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
+            restored = self._dedupe_todo_snapshot_messages(restored)
             self.conversation_history = restored
-            msg_count = len([m for m in restored if m.get("role") == "user"])
+            self._hydrate_local_todo_store_from_history(restored, overwrite=True)
+            visible_restored = [m for m in restored if not self._is_todo_snapshot_message(m)]
+            msg_count = len([m for m in visible_restored if m.get("role") == "user"])
             title_part = ""
             if session_meta.get("title"):
                 title_part = f' "{session_meta["title"]}"'
@@ -2636,7 +3217,7 @@ class HermesCLI:
                 f"[#DAA520]↻ Resumed session [bold]{self.session_id}[/bold]"
                 f"{title_part} "
                 f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
-                f"{len(restored)} total messages)[/]"
+                f"{len(visible_restored)} total messages)[/]"
             )
         else:
             self.console.print(
@@ -2703,6 +3284,8 @@ class HermesCLI:
             if role == "system":
                 continue
             if role == "tool":
+                continue
+            if self._is_todo_snapshot_message(msg):
                 continue
 
             if role == "user":
@@ -3631,7 +4214,10 @@ class HermesCLI:
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        restored = self._dedupe_todo_snapshot_messages(restored)
         self.conversation_history = restored
+        self._hydrate_local_todo_store_from_history(restored, overwrite=True)
+        visible_restored = [m for m in restored if not self._is_todo_snapshot_message(m)]
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -3652,18 +4238,21 @@ class HermesCLI:
                 try:
                     from tools.todo_tool import TodoStore
                     self.agent._todo_store = TodoStore()
+                    local_store = getattr(self, "_local_todo_store", None)
+                    if local_store and local_store.has_items():
+                        self.agent._todo_store.write(local_store.read(), merge=False)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
         title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
-        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+        msg_count = len([m for m in visible_restored if m.get("role") == "user"])
         if self.conversation_history:
             _cprint(
                 f"  ↻ Resumed session {target_id}{title_part}"
                 f" ({msg_count} user message{'s' if msg_count != 1 else ''},"
-                f" {len(self.conversation_history)} total)"
+                f" {len(visible_restored)} total)"
             )
         else:
             _cprint(f"  ↻ Resumed session {target_id}{title_part} — no messages, starting fresh.")
@@ -3705,6 +4294,9 @@ class HermesCLI:
 
         # Save the current session's state before branching
         parent_session_id = self.session_id
+        branch_history = self._dedupe_todo_snapshot_messages(self.conversation_history)
+        self.conversation_history = branch_history
+        branch_todos = self._get_todo_items()
 
         # End the old session
         try:
@@ -3729,7 +4321,7 @@ class HermesCLI:
             return
 
         # Copy conversation history to the new session
-        for msg in self.conversation_history:
+        for msg in branch_history:
             try:
                 self._session_db.append_message(
                     session_id=new_session_id,
@@ -3766,12 +4358,15 @@ class HermesCLI:
                 try:
                     from tools.todo_tool import TodoStore
                     self.agent._todo_store = TodoStore()
+                    if branch_todos:
+                        self.agent._todo_store.write(branch_todos, merge=False)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
-        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+        visible_history = [m for m in self.conversation_history if not self._is_todo_snapshot_message(m)]
+        msg_count = len([m for m in visible_history if m.get("role") == "user"])
         _cprint(
             f"  ⑂ Branched session \"{branch_title}\""
             f" ({msg_count} user message{'s' if msg_count != 1 else ''})"
@@ -5894,20 +6489,32 @@ class HermesCLI:
             logger.debug("Edit snapshot capture failed for %s", function_name, exc_info=True)
 
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
-        """Render file edits with inline diff after write-capable tools complete."""
-        snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
-        try:
-            from agent.display import render_edit_diff_with_delta
+        """Handle tool-specific UI updates after completion."""
+        pending_snapshots = getattr(self, "_pending_edit_snapshots", None)
+        snapshot = pending_snapshots.pop(tool_call_id, None) if isinstance(pending_snapshots, dict) else None
+        if getattr(self, "_inline_diffs_enabled", True):
+            try:
+                from agent.display import render_edit_diff_with_delta
 
-            render_edit_diff_with_delta(
-                function_name,
-                function_result,
-                function_args=function_args,
-                snapshot=snapshot,
-                print_fn=_cprint,
-            )
-        except Exception:
-            logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+                render_edit_diff_with_delta(
+                    function_name,
+                    function_result,
+                    function_args=function_args,
+                    snapshot=snapshot,
+                    print_fn=_cprint,
+                )
+            except Exception:
+                logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+
+        if function_name == "todo":
+            try:
+                if function_args.get("todos") is not None:
+                    items = self._get_todo_items()
+                    self._mark_todo_plan_updated(items)
+                    self._persist_plan_snapshot(items)
+            except Exception:
+                logger.debug("Todo plan widget update failed", exc_info=True)
+            self._invalidate(min_interval=0)
 
     # ====================================================================
     # Voice mode methods
@@ -7216,6 +7823,8 @@ class HermesCLI:
         secret_widget,
         approval_widget,
         clarify_widget,
+        plan_popup_widget,
+        plan_widget,
         spinner_widget,
         spacer,
         status_bar,
@@ -7238,6 +7847,8 @@ class HermesCLI:
             secret_widget,
             approval_widget,
             clarify_widget,
+            plan_popup_widget,
+            plan_widget,
             spinner_widget,
             spacer,
             *self._get_extra_tui_widgets(),
@@ -7315,6 +7926,7 @@ class HermesCLI:
         self._clarify_state = None      # dict with question, choices, selected, response_queue
         self._clarify_freetext = False  # True when user chose "Other" and is typing
         self._clarify_deadline = 0      # monotonic timestamp when the clarify times out
+        self._plan_popup_state = None   # popup plan board / local editor state
 
         # Sudo password prompt state (similar mechanism to clarify)
         self._sudo_state = None         # dict with response_queue when active
@@ -7435,6 +8047,14 @@ class HermesCLI:
                     event.app.invalidate()
                 return
 
+            # --- Plan popup entry mode: add a task or review loop block ---
+            if self._plan_popup_state and self._plan_popup_state.get("mode") in {"add_task", "add_review"}:
+                text = event.app.current_buffer.text.strip()
+                if self._plan_popup_commit_entry(text):
+                    event.app.current_buffer.reset(append_to_history=False)
+                event.app.invalidate()
+                return
+
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
@@ -7509,6 +8129,57 @@ class HermesCLI:
                 # No menu and no suggestion — start completions from scratch
                 buf.start_completion()
 
+        @kb.add('c-p')
+        def toggle_plan_popup(event):
+            """Toggle the interactive plan-board popup."""
+            if self._sudo_state or self._secret_state or self._approval_state or self._clarify_state:
+                return
+            self._toggle_plan_popup()
+            event.app.invalidate()
+
+        _plan_popup_browse = Condition(lambda: bool(self._plan_popup_state) and self._plan_popup_state.get("mode") == "browse")
+
+        @kb.add('up', filter=_plan_popup_browse)
+        def plan_popup_up(event):
+            self._plan_popup_move_selection(-1)
+            event.app.invalidate()
+
+        @kb.add('down', filter=_plan_popup_browse)
+        def plan_popup_down(event):
+            self._plan_popup_move_selection(1)
+            event.app.invalidate()
+
+        @kb.add('a', filter=_plan_popup_browse)
+        def plan_popup_add_task(event):
+            self._plan_popup_start_entry("add_task")
+            event.app.invalidate()
+
+        @kb.add('r', filter=_plan_popup_browse)
+        def plan_popup_add_review(event):
+            self._plan_popup_start_entry("add_review")
+            event.app.invalidate()
+
+        @kb.add('space', filter=_plan_popup_browse)
+        def plan_popup_toggle_done(event):
+            self._plan_popup_toggle_selected_completed()
+            event.app.invalidate()
+
+        @kb.add('i', filter=_plan_popup_browse)
+        def plan_popup_mark_in_progress(event):
+            self._plan_popup_set_selected_status("in_progress")
+            event.app.invalidate()
+
+        @kb.add('escape', filter=Condition(lambda: bool(self._plan_popup_state)))
+        def plan_popup_escape(event):
+            state = self._plan_popup_state or {}
+            if state.get("mode") in {"add_task", "add_review"}:
+                state["mode"] = "browse"
+                event.app.current_buffer.reset()
+                event.app.invalidate()
+                return
+            self._close_plan_popup()
+            event.app.invalidate()
+
         # --- Clarify tool: arrow-key navigation for multiple-choice questions ---
 
         @kb.add('up', filter=Condition(lambda: bool(self._clarify_state) and not self._clarify_freetext))
@@ -7547,7 +8218,7 @@ class HermesCLI:
         # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
         # history browsing when on the first/last line (or single-line input).
         _normal_input = Condition(
-            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state
+            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state and not self._plan_popup_state
         )
 
         @kb.add('up', filter=_normal_input)
@@ -7826,7 +8497,7 @@ class HermesCLI:
             style='class:input-area',
             multiline=True,
             wrap_lines=True,
-            read_only=Condition(lambda: bool(cli_ref._command_running)),
+            read_only=Condition(lambda: bool(cli_ref._command_running) or (bool(cli_ref._plan_popup_state) and cli_ref._plan_popup_state.get("mode") == "browse")),
             history=FileHistory(str(self._history_file)),
             completer=_completer,
             complete_while_typing=True,
@@ -7952,6 +8623,13 @@ class HermesCLI:
                 return "type your answer here and press Enter"
             if cli_ref._clarify_state:
                 return ""
+            if cli_ref._plan_popup_state:
+                mode = cli_ref._plan_popup_state.get("mode", "browse")
+                if mode == "add_task":
+                    return "new task text..."
+                if mode == "add_review":
+                    return "title | success criteria | reviewer note(optional)"
+                return "Ctrl+P to close the plan board"
             if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
                 status = cli_ref._command_status or "Processing command..."
@@ -8004,6 +8682,14 @@ class HermesCLI:
                     ('class:clarify-countdown', countdown),
                 ]
 
+            if cli_ref._plan_popup_state:
+                mode = cli_ref._plan_popup_state.get('mode', 'browse')
+                if mode == 'add_task':
+                    return [('class:hint', '  add task · type text and press Enter')]
+                if mode == 'add_review':
+                    return [('class:hint', '  add review loop · title | success criteria | reviewer note(optional)')]
+                return [('class:hint', '  ↑/↓ move · a task · r review loop · space done · i active · Esc close')]
+
             if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
                 return [
@@ -8013,7 +8699,7 @@ class HermesCLI:
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._clarify_state or cli_ref._command_running:
+            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._clarify_state or cli_ref._plan_popup_state or cli_ref._command_running:
                 return 1
             # Keep a 1-line spacer while agent runs so output doesn't push
             # right up against the top rule of the input area
@@ -8139,6 +8825,34 @@ class HermesCLI:
                 wrap_lines=True,
             ),
             filter=Condition(lambda: cli_ref._clarify_state is not None),
+        )
+
+        def _get_plan_popup_display():
+            state = cli_ref._plan_popup_state
+            if not state:
+                return []
+            content_lines = [text for _style, text in cli_ref._build_plan_popup_lines()]
+            title = '📋 Plan Board'
+            box_width = _panel_box_width(title, content_lines, min_width=54, max_width=86)
+            inner_text_width = max(8, box_width - 2)
+            lines = []
+            lines.append(('class:plan-popup-border', '╭─ '))
+            lines.append(('class:plan-popup-title', title))
+            lines.append(('class:plan-popup-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
+            _append_blank_panel_line(lines, 'class:plan-popup-border', box_width)
+            for style, text in cli_ref._build_plan_popup_lines(width=inner_text_width):
+                for wrapped in _wrap_panel_text(text, inner_text_width, subsequent_indent='  '):
+                    _append_panel_line(lines, 'class:plan-popup-border', f'class:{style}', wrapped, box_width)
+            _append_blank_panel_line(lines, 'class:plan-popup-border', box_width)
+            lines.append(('class:plan-popup-border', '╰' + ('─' * box_width) + '╯\n'))
+            return lines
+
+        plan_popup_widget = ConditionalContainer(
+            Window(
+                FormattedTextControl(_get_plan_popup_display),
+                wrap_lines=True,
+            ),
+            filter=Condition(lambda: cli_ref._plan_popup_state is not None),
         )
 
         # --- Sudo password: display widget ---
@@ -8268,6 +8982,15 @@ class HermesCLI:
             filter=Condition(lambda: cli_ref._voice_mode),
         )
 
+        plan_widget = ConditionalContainer(
+            Window(
+                content=FormattedTextControl(lambda: cli_ref._get_todo_plan_fragments()),
+                height=lambda: cli_ref._get_todo_plan_height(),
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: bool(cli_ref._build_todo_plan_lines()) and cli_ref._plan_popup_state is None),
+        )
+
         status_bar = ConditionalContainer(
             Window(
                 content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
@@ -8300,6 +9023,8 @@ class HermesCLI:
                     secret_widget=secret_widget,
                     approval_widget=approval_widget,
                     clarify_widget=clarify_widget,
+                    plan_popup_widget=plan_popup_widget,
+                    plan_widget=plan_widget,
                     spinner_widget=spinner_widget,
                     spacer=spacer,
                     status_bar=status_bar,
@@ -8327,6 +9052,17 @@ class HermesCLI:
             'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
+            'plan-heading': '#FFF8DC bold',
+            'plan-summary': '#8B8682 italic',
+            'plan-active': '#00D7FF bold',
+            'plan-done': '#8FBC8F',
+            'plan-pending': '#C0C0C0',
+            'plan-cancelled': '#8B8682 italic',
+            'plan-popup-border': '#CD7F32',
+            'plan-popup-title': '#FFD700 bold',
+            'plan-popup-text': '#FFF8DC',
+            'plan-popup-selected': '#00D7FF bold',
+            'plan-popup-meta': '#8B8682 italic',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges

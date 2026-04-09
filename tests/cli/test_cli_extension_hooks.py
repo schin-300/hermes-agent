@@ -77,6 +77,8 @@ class TestExtensionHookDefaults:
             secret_widget="secret",
             approval_widget="approval",
             clarify_widget="clarify",
+            plan_popup_widget="plan-popup",
+            plan_widget="plan-widget",
             spinner_widget="spinner",
             spacer="spacer",
             status_bar="status",
@@ -89,7 +91,7 @@ class TestExtensionHookDefaults:
         )
         # First element is Window(height=0), rest are the named widgets
         assert children[1:] == [
-            "sudo", "secret", "approval", "clarify", "spinner",
+            "sudo", "secret", "approval", "clarify", "plan-popup", "plan-widget", "spinner",
             "spacer", "status", "top-rule", "image-bar", "input-area",
             "bottom-rule", "voice-status", "completions-menu",
         ]
@@ -106,6 +108,8 @@ class TestExtensionHookSubclass:
             secret_widget="secret",
             approval_widget="approval",
             clarify_widget="clarify",
+            plan_popup_widget="plan-popup",
+            plan_widget="plan-widget",
             spinner_widget="spinner",
             spacer="spacer",
             status_bar="status",
@@ -116,9 +120,16 @@ class TestExtensionHookSubclass:
             voice_status_bar="voice-status",
             completions_menu="completions-menu",
         )
-        # Extra widgets should appear between spacer and status bar
+        # Extra widgets should appear between spacer and the built-in status bar.
+        spinner_idx = children.index("spinner")
         spacer_idx = children.index("spacer")
+        popup_idx = children.index("plan-popup")
+        plan_idx = children.index("plan-widget")
         status_idx = children.index("status")
+        assert children[spinner_idx - 1] == "plan-widget"
+        assert children[plan_idx - 1] == "plan-popup"
+        assert popup_idx == plan_idx - 1
+        assert plan_idx == spinner_idx - 1
         assert children[spacer_idx + 1] == "radio-menu"
         assert children[spacer_idx + 2] == "mini-player"
         assert children[spacer_idx + 3] == "status"
