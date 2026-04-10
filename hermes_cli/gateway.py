@@ -168,7 +168,7 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None)
     """
     pids = find_gateway_pids(exclude_pids=exclude_pids)
     killed = 0
-    
+
     for pid in pids:
         try:
             if force and not is_windows():
@@ -181,44 +181,137 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None)
             pass
         except PermissionError:
             print(f"⚠ Permission denied to kill PID {pid}")
-    
+
     return killed
+
+
+def _read_process_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    except Exception:
+        try:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
+
+def _read_process_environ_home(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except Exception:
+        return None
+    for item in raw:
+        if item.startswith(b"HERMES_HOME="):
+            try:
+                return Path(item.split(b"=", 1)[1].decode("utf-8", errors="replace")).expanduser().resolve().as_posix()
+            except Exception:
+                return None
+    return None
+
+
+def _read_process_cwd(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/cwd").resolve().as_posix()
+    except Exception:
+        return None
+
+
+def find_current_profile_gateway_pids(exclude_pids: set | None = None) -> list[int]:
+    """Best-effort gateway PID discovery for the active Hermes profile."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    profile_name = get_active_profile_name()
+    target_home = get_hermes_home().resolve().as_posix()
+    target_root = PROJECT_ROOT.resolve().as_posix()
+    candidates = []
+
+    for pid in find_gateway_pids(exclude_pids=exclude_pids):
+        env_home = _read_process_environ_home(pid)
+        if env_home and env_home == target_home:
+            candidates.append(pid)
+            continue
+
+        cmdline = _read_process_cmdline(pid)
+        cwd = _read_process_cwd(pid) or ""
+        has_profile_flag = (" -p " in f" {cmdline} ") or (" --profile " in f" {cmdline} ") or ("--profile=" in cmdline)
+
+        if profile_name not in {"default", "custom"}:
+            if f" -p {profile_name} " in f" {cmdline} " or f" --profile {profile_name} " in f" {cmdline} " or f"--profile={profile_name}" in cmdline:
+                candidates.append(pid)
+            continue
+
+        if not has_profile_flag and (target_root in cmdline or cwd == target_root):
+            candidates.append(pid)
+
+    return sorted(set(candidates))
 
 
 def stop_profile_gateway() -> bool:
     """Stop only the gateway for the current profile (HERMES_HOME-scoped).
 
-    Uses the PID file written by start_gateway(), so it only kills the
-    gateway belonging to this profile — not gateways from other profiles.
-    Returns True if a process was stopped, False if none was found.
+    Prefer the profile PID file, but fall back to best-effort process discovery
+    for older/manual launches where the PID file is missing or was removed too
+    early.
     """
     try:
         from gateway.status import get_running_pid, remove_pid_file
     except ImportError:
         return False
 
+    targets: list[int] = []
     pid = get_running_pid()
-    if pid is None:
+    if pid is not None:
+        targets.append(pid)
+    else:
+        targets.extend(find_current_profile_gateway_pids())
+
+    targets = sorted(set(int(p) for p in targets if p))
+    if not targets:
         return False
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
-    except PermissionError:
-        print(f"⚠ Permission denied to kill PID {pid}")
-        return False
-
-    # Wait briefly for it to exit
-    import time as _time
-    for _ in range(20):
+    stopped_any = False
+    for target_pid in targets:
         try:
-            os.kill(pid, 0)
-            _time.sleep(0.5)
-        except (ProcessLookupError, PermissionError):
-            break
+            os.kill(target_pid, signal.SIGTERM)
+            stopped_any = True
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            print(f"⚠ Permission denied to kill PID {target_pid}")
 
-    remove_pid_file()
+    if not stopped_any:
+        return False
+
+    import time as _time
+    deadline = _time.monotonic() + 5.0
+    remaining = set(targets)
+    while remaining and _time.monotonic() < deadline:
+        next_remaining = set()
+        for target_pid in remaining:
+            try:
+                os.kill(target_pid, 0)
+                next_remaining.add(target_pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if not next_remaining:
+            break
+        remaining = next_remaining
+        _time.sleep(0.25)
+
+    if remaining and not is_windows():
+        for target_pid in list(remaining):
+            try:
+                os.kill(target_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        _time.sleep(0.25)
+        remaining = {target_pid for target_pid in remaining if Path(f"/proc/{target_pid}").exists()}
+
+    if not remaining:
+        remove_pid_file()
+    else:
+        print(f"⚠ Gateway process still running for this profile (PID: {', '.join(map(str, sorted(remaining)))})")
     return True
 
 
@@ -2250,14 +2343,17 @@ def gateway_command(args):
                 except subprocess.CalledProcessError:
                     pass
 
+            stopped_profile = stop_profile_gateway()
             if not service_available:
-                # No systemd/launchd — use profile-scoped PID file
-                if stop_profile_gateway():
+                if stopped_profile:
                     print("✓ Stopped gateway for this profile")
                 else:
                     print("✗ No gateway running for this profile")
             else:
-                print(f"✓ Stopped {get_service_name()} service")
+                if stopped_profile:
+                    print(f"✓ Stopped {get_service_name()} service and cleaned up profile gateway process")
+                else:
+                    print(f"✓ Stopped {get_service_name()} service")
     
     elif subcmd == "restart":
         # Try service first, fall back to killing and restarting
@@ -2317,14 +2413,17 @@ def gateway_command(args):
     elif subcmd == "status":
         deep = getattr(args, 'deep', False)
         system = getattr(args, 'system', False)
-        
-        # Check for service first
+
         if is_linux() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             systemd_status(deep, system=system)
+            manual_pids = find_current_profile_gateway_pids(exclude_pids=_get_service_pids())
+            if manual_pids:
+                print()
+                print(f"⚠ Manual gateway process still running for this profile (PID: {', '.join(map(str, manual_pids))})")
+                print("  `hermes gateway close` should stop it; if it does not, the stop path is broken or stale.")
         elif is_macos() and get_launchd_plist_path().exists():
             launchd_status(deep)
         else:
-            # Check for manually running processes
             pids = find_gateway_pids()
             if pids:
                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
