@@ -1612,9 +1612,16 @@ class HermesCLI:
         )
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
+        from hermes_cli.context_limit import CONTEXT_MODE_DEFAULT, CONTEXT_MODE_PROFILES
+
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
+        _default_context_profile = CONTEXT_MODE_PROFILES[CONTEXT_MODE_DEFAULT]
+        self.context_length_override: Optional[int] = int(_default_context_profile["context_length"])
+        self.context_compaction_threshold: float = float(
+            _default_context_profile["compression_threshold"]
+        )
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -1818,6 +1825,87 @@ class HermesCLI:
         safe_percent = max(0, min(100, percent_used or 0))
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
+
+    def _current_context_limit(self) -> Optional[int]:
+        agent = getattr(self, "agent", None)
+        compressor = getattr(agent, "context_compressor", None) if agent else None
+        context_length = getattr(compressor, "context_length", None) if compressor else None
+        if context_length:
+            return int(context_length)
+        override = getattr(self, "context_length_override", None)
+        return int(override) if override else None
+
+    def _current_context_threshold(self) -> Optional[float]:
+        agent = getattr(self, "agent", None)
+        compressor = getattr(agent, "context_compressor", None) if agent else None
+        threshold_percent = getattr(compressor, "threshold_percent", None) if compressor else None
+        if threshold_percent is not None:
+            return float(threshold_percent)
+        threshold_percent = getattr(self, "context_compaction_threshold", None)
+        return float(threshold_percent) if threshold_percent is not None else None
+
+    def _current_context_mode(self) -> str:
+        from hermes_cli.context_limit import detect_context_mode
+
+        return (
+            detect_context_mode(
+                self._current_context_limit(),
+                self._current_context_threshold(),
+            )
+            or "custom"
+        )
+
+    def _set_session_context_profile(
+        self,
+        *,
+        context_length: int | None,
+        compression_threshold: float | None,
+    ) -> int:
+        if context_length is not None:
+            self.context_length_override = int(context_length)
+        if compression_threshold is not None:
+            self.context_compaction_threshold = float(compression_threshold)
+
+        applied = self.context_length_override or 0
+        if self.agent:
+            if hasattr(self.agent, "set_context_profile"):
+                applied = self.agent.set_context_profile(
+                    context_length=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                )
+            elif hasattr(self.agent, "set_context_length_override"):
+                applied = self.agent.set_context_length_override(self.context_length_override)
+
+        if hasattr(self, "_invalidate"):
+            self._invalidate()
+        return int(applied or 0)
+
+    def _print_context_profile_status(
+        self,
+        *,
+        context_mode: str,
+        context_length: int,
+        compression_threshold: float | None,
+    ) -> None:
+        _cprint(f"  {_GOLD}Context mode: {context_mode}{_RST}")
+        _cprint(f"  {_GOLD}Context limit: {context_length:,} tokens{_RST}")
+        if compression_threshold is not None:
+            threshold_tokens = int(context_length * compression_threshold)
+            _cprint(
+                "  "
+                f"{_DIM}Auto-compaction at {int(compression_threshold * 100)}% = "
+                f"{threshold_tokens:,} tokens{_RST}"
+            )
+        _cprint(f"  {_DIM}Session only — not saved to config. Resets on /new or /resume.{_RST}")
+
+    def _reset_session_context_mode(self) -> None:
+        from hermes_cli.context_limit import CONTEXT_MODE_DEFAULT, CONTEXT_MODE_PROFILES
+
+        profile = CONTEXT_MODE_PROFILES[CONTEXT_MODE_DEFAULT]
+        self._set_session_context_profile(
+            context_length=int(profile["context_length"]),
+            compression_threshold=float(profile["compression_threshold"]),
+        )
 
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
