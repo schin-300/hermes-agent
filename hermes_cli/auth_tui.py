@@ -54,6 +54,9 @@ KITTY_METER_MIN_WIDTH = 96
 KITTY_METER_MIN_HEIGHT = 20
 MAX_POOL_DRAIN_SAMPLES = 64
 MAX_VISIBLE_POOL_DRAIN_POLLS = 30
+POOL_DRAIN_ACTIVITY_EPSILON = 0.05
+POOL_DRAIN_MIN_RECENT_WINDOW_SECONDS = 60.0
+POOL_DRAIN_RECENT_WINDOW_POLLS = 6
 READY_ACCOUNT_THRESHOLD_PERCENT = 5.0
 REFRESH_SCOPE_ALL = "all"
 _KITTY_PLACEHOLDER = "\U0010EEEE"
@@ -429,12 +432,12 @@ def _format_runway_duration(hours: Optional[float]) -> str:
 
 def _primary_runway_hours(
     total_available_percent: float,
-    latest_sample: Optional[CodexPoolDrainSample],
+    rate_percent_per_hour: Optional[float],
 ) -> Optional[float]:
-    if latest_sample is None:
+    if rate_percent_per_hour is None:
         return None
-    rate = max(0.0, float(latest_sample.rate_percent_per_hour))
-    if rate <= 0.05:
+    rate = max(0.0, float(rate_percent_per_hour))
+    if rate <= POOL_DRAIN_ACTIVITY_EPSILON:
         return math.inf
     return max(0.0, float(total_available_percent)) / rate
 
@@ -474,7 +477,6 @@ def _build_pool_drain_sample(
     dropping_accounts = 0
     resetting_accounts = 0
     total_drop_percent = 0.0
-    epsilon = 0.05
 
     if elapsed_seconds > 0 and previous_by_id:
         for entry_id, (current_available, current_reset_at_ms) in current_by_id.items():
@@ -492,7 +494,7 @@ def _build_pool_drain_sample(
                 resetting_accounts += 1
                 continue
             drop_percent = previous_available - current_available
-            if drop_percent > epsilon:
+            if drop_percent > POOL_DRAIN_ACTIVITY_EPSILON:
                 total_drop_percent += drop_percent
                 dropping_accounts += 1
 
@@ -572,6 +574,81 @@ def _next_auto_refresh_interval_seconds(current: float) -> float:
         if upper > current > lower:
             return lower
     return AUTO_REFRESH_INTERVAL_PRESETS[0]
+
+
+def _pool_drain_recent_window_seconds(auto_refresh_seconds: float) -> float:
+    interval = max(0.0, float(auto_refresh_seconds))
+    if interval <= 0.0:
+        return POOL_DRAIN_MIN_RECENT_WINDOW_SECONDS
+    return max(POOL_DRAIN_MIN_RECENT_WINDOW_SECONDS, interval * POOL_DRAIN_RECENT_WINDOW_POLLS)
+
+
+
+def _format_recent_window_label(seconds: float) -> str:
+    seconds = max(1.0, float(seconds))
+    rounded_seconds = round(seconds)
+    if rounded_seconds < 120:
+        return f"{int(rounded_seconds)}s"
+    minutes = seconds / 60.0
+    rounded_minutes = round(minutes)
+    if math.isclose(minutes, rounded_minutes, abs_tol=1e-6):
+        return f"{int(rounded_minutes)}m"
+    return f"{minutes:.1f}".rstrip("0").rstrip(".") + "m"
+
+
+
+def _pool_drain_recent_rate(
+    samples: list[CodexPoolDrainSample],
+    *,
+    auto_refresh_seconds: float,
+) -> tuple[float, float]:
+    window_seconds = _pool_drain_recent_window_seconds(auto_refresh_seconds)
+    if len(samples) < 2:
+        latest_rate = samples[-1].rate_percent_per_hour if samples else 0.0
+        return window_seconds, max(0.0, float(latest_rate))
+
+    last_index = len(samples) - 1
+    start_interval_index = last_index
+    while start_interval_index > 1:
+        elapsed = samples[last_index].captured_at - samples[start_interval_index - 1].captured_at
+        if elapsed >= window_seconds:
+            break
+        start_interval_index -= 1
+
+    start_sample_index = max(0, start_interval_index - 1)
+    elapsed_seconds = max(0.0, samples[last_index].captured_at - samples[start_sample_index].captured_at)
+    total_drop_percent = sum(max(0.0, float(sample.total_drop_percent)) for sample in samples[start_interval_index:])
+    if elapsed_seconds <= 0.0:
+        return window_seconds, max(0.0, float(samples[-1].rate_percent_per_hour))
+    return window_seconds, total_drop_percent / (elapsed_seconds / 3600.0)
+
+
+
+def _pool_drain_last_burn_age_seconds(samples: list[CodexPoolDrainSample]) -> Optional[float]:
+    now = time.time()
+    for sample in reversed(samples):
+        if float(sample.total_drop_percent) > POOL_DRAIN_ACTIVITY_EPSILON:
+            return max(0.0, now - float(sample.captured_at))
+    return None
+
+
+
+def _format_age_ago(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "never"
+    seconds = max(0.0, float(seconds))
+    rounded_seconds = round(seconds)
+    if rounded_seconds < 120:
+        return f"{int(rounded_seconds)}s ago"
+    minutes = seconds / 60.0
+    rounded_minutes = round(minutes)
+    if math.isclose(minutes, rounded_minutes, abs_tol=1e-6):
+        return f"{int(rounded_minutes)}m ago"
+    if minutes < 120:
+        return f"{minutes:.1f}".rstrip("0").rstrip(".") + "m ago"
+    hours = minutes / 60.0
+    return f"{hours:.1f}".rstrip("0").rstrip(".") + "h ago"
+
 
 
 def _pool_drain_plot_points_from_values(
@@ -654,21 +731,25 @@ def _render_pool_drain_meter(
         stat1 = _meter_text_line(width, "warming up — waiting for two live polls")
         stat2 = _meter_text_line(
             width,
-            f"drain n/a  •  drop n/a  •  auto {poll_interval_text} all",
+            f"drain n/a  •  drop n/a  •  auto {poll_interval_text}",
         )
         graph_height = max(1, height - 4)
         graph_lines = [_meter_text_line(width, "·" * max(1, width - 6)) for _ in range(graph_height)]
         return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
 
+    recent_window_seconds, recent_rate = _pool_drain_recent_rate(samples, auto_refresh_seconds=auto_refresh_seconds)
     stat1 = _meter_text_line(
         width,
-        f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}",
+        (
+            f"{_format_recent_window_label(recent_window_seconds)} avg {recent_rate:.1f} pool-%/h  •  "
+            f"live {latest.rate_percent_per_hour:.1f}  •  drop {latest.dropping_accounts}/{latest.compared_accounts}"
+        ),
     )
     stat2 = _meter_text_line(
         width,
         (
-            f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  "
-            f"auto {poll_interval_text} all"
+            f"avg {latest.average_available_percent:.0f}%  •  burn {_format_age_ago(_pool_drain_last_burn_age_seconds(samples))}  •  "
+            f"{visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  auto {poll_interval_text}"
         ),
     )
 
@@ -1677,6 +1758,7 @@ def _pool_analytics_lines(
     analytics: CodexPoolAnalytics,
     *,
     latest_sample: Optional[CodexPoolDrainSample] = None,
+    runway_rate_percent_per_hour: Optional[float] = None,
 ) -> list[str]:
     if analytics.total <= 0:
         return [
@@ -1685,16 +1767,20 @@ def _pool_analytics_lines(
             "both-window avg n/a  •  5h runway warming up",
         ]
 
-    runway_hours = _primary_runway_hours(analytics.primary_total_available_pct, latest_sample)
+    runway_rate = runway_rate_percent_per_hour
+    if runway_rate is None and latest_sample is not None:
+        runway_rate = latest_sample.rate_percent_per_hour
+    runway_hours = _primary_runway_hours(analytics.primary_total_available_pct, runway_rate)
     runway_text = _format_runway_duration(runway_hours)
-    if latest_sample is None:
+    if runway_rate is None:
         runway_suffix = f"{analytics.primary_label} runway {runway_text}"
     else:
-        rate = max(0.0, float(latest_sample.rate_percent_per_hour))
+        rate = max(0.0, float(runway_rate))
+        rate_prefix = "recent " if latest_sample is not None else ""
         if math.isinf(runway_hours):
-            runway_suffix = f"{analytics.primary_label} runway idle @ {rate:.1f} pool-%/h"
+            runway_suffix = f"{analytics.primary_label} runway idle @ {rate_prefix}{rate:.1f} pool-%/h"
         else:
-            runway_suffix = f"{analytics.primary_label} runway {runway_text} @ {rate:.1f} pool-%/h"
+            runway_suffix = f"{analytics.primary_label} runway {runway_text} @ {rate_prefix}{rate:.1f} pool-%/h"
 
     return [
         (
@@ -2006,9 +2092,21 @@ class CodexAuthTui:
     def _overview_summary_lines(self, width: int) -> list[str]:
         with self._lock:
             snapshots = list(self.snapshots)
-            latest = self._pool_drain_history[-1] if self._pool_drain_history else None
+            history = list(self._pool_drain_history)
+            latest = history[-1] if history else None
+            auto_refresh_seconds = self.auto_refresh_interval_seconds
         analytics = _compute_pool_analytics(snapshots)
-        return [_clip(line, width - 1) for line in _pool_analytics_lines(analytics, latest_sample=latest)]
+        recent_rate = None
+        if history:
+            _window_seconds, recent_rate = _pool_drain_recent_rate(history, auto_refresh_seconds=auto_refresh_seconds)
+        return [
+            _clip(line, width - 1)
+            for line in _pool_analytics_lines(
+                analytics,
+                latest_sample=latest,
+                runway_rate_percent_per_hour=recent_rate,
+            )
+        ]
 
     def _graph_rows(self, width: int, height: int) -> int:
         if not self.kitty_meter_enabled:
@@ -2019,20 +2117,25 @@ class CodexAuthTui:
 
     def _graph_summary_lines(self, width: int) -> list[str]:
         with self._lock:
-            latest = self._pool_drain_history[-1] if self._pool_drain_history else None
-            visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(self._pool_drain_history))
+            history = list(self._pool_drain_history)
+            latest = history[-1] if history else None
+            visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(history))
+            auto_refresh_seconds = self.auto_refresh_interval_seconds
         if latest is None:
             return [
                 _clip("5h pool burn rate", width - 1),
                 _clip("warming up — waiting for two live polls", width - 1),
             ]
+        recent_window_seconds, recent_rate = _pool_drain_recent_rate(history, auto_refresh_seconds=auto_refresh_seconds)
+        last_burn_age = _pool_drain_last_burn_age_seconds(history)
         return [
             _clip(f"{latest.label} pool burn rate", width - 1),
             _clip(
                 (
-                    f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
-                    f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  "
-                    f"auto {_format_poll_interval_seconds(self.auto_refresh_interval_seconds)} all"
+                    f"{_format_recent_window_label(recent_window_seconds)} avg {recent_rate:.1f} pool-%/h  •  "
+                    f"live {latest.rate_percent_per_hour:.1f}  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
+                    f"last burn {_format_age_ago(last_burn_age)}  •  avg left {latest.average_available_percent:.0f}%  •  "
+                    f"{visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  auto {_format_poll_interval_seconds(auto_refresh_seconds)} all"
                 ),
                 width - 1,
             ),

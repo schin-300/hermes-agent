@@ -33,7 +33,9 @@ from hermes_cli.auth_tui import (
     _compute_pool_analytics,
     _footer_line,
     _kitty_graphics_requested,
+    _pool_drain_last_burn_age_seconds,
     _pool_drain_points,
+    _pool_drain_recent_rate,
     _render_pool_drain_meter,
     auth_view_command,
     build_codex_profile_snapshots,
@@ -487,13 +489,14 @@ def test_build_pool_drain_sample_ignores_reset_like_refills(monkeypatch):
     assert sample.resetting_accounts == 1
 
 
-def test_render_pool_drain_meter_includes_title_stats_and_plot():
+def test_render_pool_drain_meter_includes_title_stats_and_plot(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 150.0)
     samples = [
         CodexPoolDrainSample(
-            captured_at=float(idx),
+            captured_at=float(ts),
             label="5h",
             rate_percent_per_hour=float(rate),
-            total_drop_percent=float(rate) / 2.0,
+            total_drop_percent=float(rate) / 120.0,
             dropping_accounts=1 if rate else 0,
             compared_accounts=3,
             tracked_accounts=4,
@@ -502,17 +505,17 @@ def test_render_pool_drain_meter_includes_title_stats_and_plot():
             total_available_percent=320.0 - (idx * 4.0),
             total_capacity_percent=400.0,
         )
-        for idx, rate in enumerate((0, 4, 11, 7, 15), start=1)
+        for idx, (ts, rate) in enumerate(((30, 0), (60, 4), (90, 11), (120, 7), (150, 15)), start=1)
     ]
 
-    lines = _render_pool_drain_meter(samples, width=58, height=8, auto_refresh_seconds=30.0)
+    lines = _render_pool_drain_meter(samples, width=64, height=8, auto_refresh_seconds=30.0)
 
     assert len(lines) == 8
     joined = "\n".join(lines)
     assert "5h pool burn rate" in joined
-    assert "drain 15.0 pool-%/h" in joined
+    assert "live 15.0" in joined
     assert "drop 1/3" in joined
-    assert "auto 30s all" in joined
+    assert "auto 30s" in joined
     assert any("●" in line or "•" in line for line in lines)
 
 
@@ -531,9 +534,98 @@ def test_render_pool_drain_meter_formats_fractional_auto_refresh_seconds():
         total_capacity_percent=200.0,
     )
 
-    lines = _render_pool_drain_meter([sample], width=58, height=8, auto_refresh_seconds=7.5)
+    lines = _render_pool_drain_meter([sample], width=64, height=8, auto_refresh_seconds=7.5)
 
-    assert "auto 7.5s all" in "\n".join(lines)
+    joined = "\n".join(lines)
+    assert "auto 7.5s" in joined
+    assert "60s avg 12.0 pool-%/h" in joined
+
+
+def test_pool_drain_recent_rate_uses_rolling_window_instead_of_latest_zero():
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(ts),
+            label="5h",
+            rate_percent_per_hour=rate,
+            total_drop_percent=drop,
+            dropping_accounts=1 if drop else 0,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0,
+            total_available_percent=320.0 - (drop * 10.0),
+            total_capacity_percent=400.0,
+        )
+        for ts, rate, drop in (
+            (0, 0.0, 0.0),
+            (10, 36.0, 0.1),
+            (20, 0.0, 0.0),
+            (30, 0.0, 0.0),
+        )
+    ]
+
+    window_seconds, rate = _pool_drain_recent_rate(samples, auto_refresh_seconds=10.0)
+
+    assert window_seconds == 60.0
+    assert rate == 12.0
+
+
+def test_pool_drain_last_burn_age_seconds_tracks_recent_nonzero_drop(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 35.0)
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(ts),
+            label="5h",
+            rate_percent_per_hour=rate,
+            total_drop_percent=drop,
+            dropping_accounts=1 if drop else 0,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0,
+            total_available_percent=320.0,
+            total_capacity_percent=400.0,
+        )
+        for ts, rate, drop in (
+            (10, 36.0, 0.1),
+            (20, 18.0, 0.06),
+            (30, 0.0, 0.0),
+        )
+    ]
+
+    assert _pool_drain_last_burn_age_seconds(samples) == 15.0
+
+
+def test_render_pool_drain_meter_shows_recent_average_and_last_burn_age(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 35.0)
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(ts),
+            label="5h",
+            rate_percent_per_hour=rate,
+            total_drop_percent=drop,
+            dropping_accounts=1 if drop else 0,
+            compared_accounts=11,
+            tracked_accounts=11,
+            resetting_accounts=0,
+            average_available_percent=69.0,
+            total_available_percent=759.0,
+            total_capacity_percent=1100.0,
+        )
+        for ts, rate, drop in (
+            (0, 0.0, 0.0),
+            (10, 0.0, 0.0),
+            (20, 72.0, 0.2),
+            (30, 0.0, 0.0),
+        )
+    ]
+
+    lines = _render_pool_drain_meter(samples, width=76, height=8, auto_refresh_seconds=10.0)
+
+    joined = "\n".join(lines)
+    assert "60s avg 24.0 pool-%/h" in joined
+    assert "live 0.0" in joined
+    assert "burn 15s ago" in joined
 
 
 def test_pool_drain_points_zoom_out_until_visible_window_fills():
@@ -1122,7 +1214,42 @@ def test_overview_summary_lines_show_multi_account_rollups_and_runway():
     assert "Week avg" in joined
     assert "eq 1.6 acct" in joined
     assert "both-window avg" in joined
-    assert "5h runway 5.6h" in joined
+    assert "5h runway 5.6h @ recent 25.0 pool-%/h" in joined
+
+
+def test_overview_summary_lines_use_recent_burn_when_latest_interval_is_idle(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 35.0)
+    tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0, kitty_meter=False, auto_refresh_interval_seconds=10.0)
+    tui.snapshots = [
+        _make_snapshot("a", STATE_AVAILABLE, primary_pct=80.0, secondary_pct=90.0),
+        _make_snapshot("b", STATE_AVAILABLE, primary_pct=60.0, secondary_pct=20.0),
+        _make_snapshot("c", STATE_LIMITED, primary_pct=0.0, secondary_pct=50.0),
+    ]
+    tui._pool_drain_history = [
+        CodexPoolDrainSample(
+            captured_at=float(ts),
+            label="5h",
+            rate_percent_per_hour=rate,
+            total_drop_percent=drop,
+            dropping_accounts=1 if drop else 0,
+            compared_accounts=3,
+            tracked_accounts=3,
+            resetting_accounts=0,
+            average_available_percent=140.0 / 3.0,
+            total_available_percent=140.0,
+            total_capacity_percent=300.0,
+        )
+        for ts, rate, drop in (
+            (0, 0.0, 0.0),
+            (10, 0.0, 0.0),
+            (20, 72.0, 0.2),
+            (30, 0.0, 0.0),
+        )
+    ]
+
+    joined = "\n".join(tui._overview_summary_lines(width=120))
+
+    assert "5h runway 5.8h @ recent 24.0 pool-%/h" in joined
 
 
 def test_render_codex_auth_smoke_test_includes_pool_summary(monkeypatch):
