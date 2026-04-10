@@ -67,6 +67,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[session|always]"),
     CommandDef("deny", "Deny a pending dangerous command", "Session",
                gateway_only=True),
+    CommandDef("answer", "Answer a pending clarify question", "Session",
+               gateway_only=True, args_hint="<response>"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg",), args_hint="<prompt>"),
     CommandDef("btw", "Ephemeral side question using session context (no tools, not persisted)", "Session",

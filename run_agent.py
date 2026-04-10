@@ -698,6 +698,8 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        self._wait_state_lock = threading.Lock()
+        self._wait_state: Optional[Dict[str, Any]] = None
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -2597,22 +2599,107 @@ class AIAgent:
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
 
+    def set_wait_state(self, kind: str, **details: Any) -> None:
+        """Record a blocking wait state such as clarify or delegated supervision."""
+        now = time.time()
+        payload: Dict[str, Any] = {
+            "kind": str(kind or "").strip() or "unknown",
+            "started_at": now,
+            "updated_at": now,
+        }
+        for key, value in details.items():
+            if value is not None:
+                payload[key] = value
+        with self._wait_state_lock:
+            existing = self._wait_state or {}
+            if existing.get("kind") == payload["kind"] and existing.get("started_at"):
+                payload["started_at"] = existing["started_at"]
+            self._wait_state = payload
+        self._touch_activity(f"waiting: {payload['kind']}")
+
+    def update_wait_state(self, **details: Any) -> None:
+        """Update details on the current wait state without resetting its start time."""
+        with self._wait_state_lock:
+            if not self._wait_state:
+                return
+            self._wait_state.update({k: v for k, v in details.items() if v is not None})
+            self._wait_state["updated_at"] = time.time()
+
+    def clear_wait_state(self) -> None:
+        """Clear any active blocking wait state."""
+        with self._wait_state_lock:
+            self._wait_state = None
+
+    def _active_child_activity_snapshot(self) -> list[dict]:
+        """Return compact activity summaries for any currently running child agents."""
+        with self._active_children_lock:
+            children = list(self._active_children)
+
+        snapshots: list[dict] = []
+        for child in children[:3]:
+            if not hasattr(child, "get_activity_summary"):
+                continue
+            try:
+                summary = child.get_activity_summary()
+            except Exception:
+                continue
+            snapshots.append({
+                "session_id": getattr(child, "session_id", None),
+                "model": getattr(child, "model", None),
+                "current_tool": summary.get("current_tool"),
+                "last_activity_desc": summary.get("last_activity_desc"),
+                "seconds_since_activity": summary.get("seconds_since_activity"),
+                "api_call_count": summary.get("api_call_count"),
+                "wait_state": summary.get("wait_state"),
+                "goal_preview": getattr(child, "_delegate_goal_preview", None),
+                "watchdog_reason": getattr(child, "_delegate_watchdog_reason", None),
+            })
+        return snapshots
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
         Called by the gateway timeout handler to report what the agent was doing
         when it was killed, and by the periodic "still working" notifications.
         """
-        elapsed = time.time() - self._last_activity_ts
+        now = time.time()
+        last_activity_ts = self._last_activity_ts
+        last_activity_desc = self._last_activity_desc
+        current_tool = self._current_tool
+
+        with self._wait_state_lock:
+            wait_state = dict(self._wait_state) if self._wait_state else None
+        if wait_state and wait_state.get("started_at"):
+            wait_state["elapsed_seconds"] = round(now - float(wait_state["started_at"]), 1)
+            if wait_state.get("kind") == "clarify" and not wait_state.get("typing_active"):
+                # A deliberate user wait should not look like a hung agent.
+                last_activity_ts = max(last_activity_ts, float(wait_state["updated_at"]))
+                last_activity_desc = f"waiting: {wait_state['kind']}"
+
+        child_snapshots = self._active_child_activity_snapshot()
+        if current_tool == "delegate_task" and child_snapshots:
+            freshest = min(
+                child_snapshots,
+                key=lambda item: float(item.get("seconds_since_activity") or 0.0),
+            )
+            child_idle = float(freshest.get("seconds_since_activity") or 0.0)
+            last_activity_ts = max(last_activity_ts, now - child_idle)
+            child_desc = freshest.get("last_activity_desc") or freshest.get("current_tool") or "child active"
+            last_activity_desc = f"delegate child: {child_desc}"
+
+        elapsed = max(0.0, now - last_activity_ts)
         return {
-            "last_activity_ts": self._last_activity_ts,
-            "last_activity_desc": self._last_activity_desc,
+            "last_activity_ts": last_activity_ts,
+            "last_activity_desc": last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
-            "current_tool": self._current_tool,
+            "current_tool": current_tool,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "wait_state": wait_state,
+            "active_children_count": len(child_snapshots),
+            "active_children": child_snapshots,
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:

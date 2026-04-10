@@ -20,7 +20,9 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +40,9 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_WATCHDOG_IDLE_SECONDS = 180
+DEFAULT_WATCHDOG_SAME_TOOL_LIMIT = 8
+WATCHDOG_POLL_SECONDS = 5
 
 
 def check_delegate_requirements() -> bool:
@@ -113,7 +118,25 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
-def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1) -> Optional[callable]:
+def _watchdog_reason(activity: dict, watch_state: dict, *, idle_timeout: int, same_tool_limit: int) -> Optional[str]:
+    """Return a watchdog interrupt reason for a child agent, or None."""
+    idle_for = float(activity.get("seconds_since_activity") or 0.0)
+    if idle_timeout > 0 and idle_for >= idle_timeout:
+        current_tool = activity.get("current_tool")
+        if current_tool:
+            return f"Delegate watchdog: child idle on {current_tool} for {int(idle_for)}s"
+        return f"Delegate watchdog: child idle for {int(idle_for)}s"
+
+    if same_tool_limit > 0 and int(watch_state.get("same_tool_repeat_count") or 0) >= same_tool_limit:
+        tool_name = watch_state.get("last_tool_name") or "unknown tool"
+        return (
+            f"Delegate watchdog: suspected loop — {tool_name} repeated "
+            f"{int(watch_state.get('same_tool_repeat_count') or 0)} times"
+        )
+    return None
+
+
+def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1, watch_state: Optional[dict] = None) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
     Two display paths:
@@ -126,8 +149,8 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     spinner = getattr(parent_agent, '_delegate_spinner', None)
     parent_cb = getattr(parent_agent, 'tool_progress_callback', None)
 
-    if not spinner and not parent_cb:
-        return None  # No display → no callback → zero behavior change
+    if not spinner and not parent_cb and watch_state is None:
+        return None  # No display and no supervision state → zero behavior change
 
     # Show 1-indexed prefix only in batch mode (multiple tasks)
     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
@@ -138,7 +161,11 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # event_type is one of: "tool.started", "tool.completed",
-        # "reasoning.available", "_thinking", "subagent_progress"
+        # "reasoning.available", "_thinking", "subagent_progress",
+        # "subagent.heartbeat", "subagent.warning"
+
+        if watch_state is not None:
+            watch_state["last_progress_event_at"] = time.time()
 
         # "_thinking" / reasoning events
         if event_type in ("_thinking", "reasoning.available"):
@@ -152,9 +179,35 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             # Don't relay thinking to gateway (too noisy for chat)
             return
 
+        if event_type in ("subagent.heartbeat", "subagent.warning"):
+            text = preview or tool_name or "subagent active"
+            if spinner:
+                try:
+                    marker = "⚠️" if event_type == "subagent.warning" else "💓"
+                    spinner.print_above(f" {prefix}├─ {marker} {text}")
+                except Exception as e:
+                    logger.debug("Spinner print_above failed: %s", e)
+            if parent_cb:
+                try:
+                    parent_cb(event_type, text)
+                except Exception as e:
+                    logger.debug("Parent callback failed: %s", e)
+            return
+
         # tool.completed — no display needed here (spinner shows on started)
         if event_type == "tool.completed":
             return
+
+        if watch_state is not None and event_type == "tool.started":
+            last_tool = watch_state.get("last_tool_name")
+            if tool_name and tool_name == last_tool:
+                watch_state["same_tool_repeat_count"] = int(watch_state.get("same_tool_repeat_count") or 0) + 1
+            else:
+                watch_state["same_tool_repeat_count"] = 1 if tool_name else 0
+                watch_state["last_tool_name"] = tool_name
+            recent = watch_state.setdefault("recent_tools", deque(maxlen=12))
+            if tool_name:
+                recent.append(tool_name)
 
         # tool.started — display and batch for parent relay
         if spinner:
@@ -255,8 +308,15 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
+    watch_state = {
+        "recent_tools": deque(maxlen=12),
+        "last_tool_name": None,
+        "same_tool_repeat_count": 0,
+        "last_progress_event_at": time.time(),
+    }
+
     # Build progress callback to relay tool calls to parent display
-    child_progress_cb = _build_child_progress_callback(task_index, parent_agent)
+    child_progress_cb = _build_child_progress_callback(task_index, parent_agent, watch_state=watch_state)
 
     # Each subagent gets its own iteration budget capped at max_iterations
     # (configurable via delegation.max_iterations, default 50).  This means
@@ -315,6 +375,9 @@ def _build_child_agent(
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, '_print_fn', None)
+    child._delegate_watch_state = watch_state
+    child._delegate_watchdog_reason = None
+    child._delegate_goal_preview = goal[:120]
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
 
@@ -368,6 +431,60 @@ def _run_single_child(
                     child._swap_credential(leased_entry)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
+
+    watchdog_cfg = _load_config()
+    idle_timeout = int(watchdog_cfg.get("watchdog_idle_seconds") or DEFAULT_WATCHDOG_IDLE_SECONDS)
+    same_tool_limit = int(watchdog_cfg.get("watchdog_same_tool_limit") or DEFAULT_WATCHDOG_SAME_TOOL_LIMIT)
+    watch_state = getattr(child, "_delegate_watch_state", {}) or {}
+    watchdog_stop = threading.Event()
+
+    def _watchdog_loop() -> None:
+        heartbeat_every = max(15, WATCHDOG_POLL_SECONDS)
+        last_heartbeat = 0.0
+        while not watchdog_stop.wait(WATCHDOG_POLL_SECONDS):
+            if getattr(child, "_interrupt_requested", False):
+                return
+            activity = {}
+            if hasattr(child, "get_activity_summary"):
+                try:
+                    activity = child.get_activity_summary()
+                except Exception:
+                    activity = {}
+            reason = _watchdog_reason(
+                activity,
+                watch_state,
+                idle_timeout=idle_timeout,
+                same_tool_limit=same_tool_limit,
+            )
+            if reason:
+                child._delegate_watchdog_reason = reason
+                try:
+                    if child_progress_cb:
+                        child_progress_cb("subagent.warning", preview=reason)
+                except Exception:
+                    pass
+                try:
+                    child.interrupt(reason)
+                except Exception as exc:
+                    logger.debug("Delegate watchdog interrupt failed: %s", exc)
+                return
+
+            now = time.time()
+            if child_progress_cb and now - last_heartbeat >= heartbeat_every and activity:
+                last_heartbeat = now
+                child_tool = activity.get("current_tool") or activity.get("last_activity_desc") or "child active"
+                idle = activity.get("seconds_since_activity")
+                if isinstance(idle, (int, float)):
+                    msg = f"{child_tool} · {int(idle)}s since last activity"
+                else:
+                    msg = str(child_tool)
+                try:
+                    child_progress_cb("subagent.heartbeat", preview=msg)
+                except Exception:
+                    pass
+
+    watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True, name=f"delegate-watchdog-{task_index}")
+    watchdog_thread.start()
 
     try:
         result = child.run_conversation(user_message=goal)
@@ -461,6 +578,9 @@ def _run_single_child(
             },
             "tool_trace": tool_trace,
         }
+        watchdog_reason = getattr(child, "_delegate_watchdog_reason", None)
+        if watchdog_reason:
+            entry["watchdog_reason"] = watchdog_reason
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -479,6 +599,7 @@ def _run_single_child(
         }
 
     finally:
+        watchdog_stop.set()
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)
@@ -813,26 +934,29 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
 
 def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG or persistent config.
+    """Load delegation config from the active HERMES_HOME, with CLI fallback.
 
-    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
-    to the persistent config (hermes_cli/config.py load_config()) so that
-    ``delegation.model`` / ``delegation.provider`` are picked up regardless
-    of the entry point (CLI, gateway, cron).
+    Prefer ``hermes_cli.config.load_config()`` because it resolves against the
+    current ``HERMES_HOME`` (important for tests, profiles, gateway, and cron).
+    Fall back to the already-loaded CLI module config only when the persistent
+    loader is unavailable.
     """
     try:
-        from cli import CLI_CONFIG
-        cfg = CLI_CONFIG.get("delegation", {})
-        if cfg:
+        from hermes_cli.config import load_config
+        full = load_config()
+        cfg = full.get("delegation", {})
+        if isinstance(cfg, dict):
             return cfg
     except Exception:
         pass
     try:
-        from hermes_cli.config import load_config
-        full = load_config()
-        return full.get("delegation", {})
+        from cli import CLI_CONFIG
+        cfg = CLI_CONFIG.get("delegation", {})
+        if isinstance(cfg, dict):
+            return cfg
     except Exception:
-        return {}
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------

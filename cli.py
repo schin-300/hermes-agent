@@ -280,7 +280,8 @@ def load_cli_config() -> Dict[str, Any]:
             "skin": "default",
         },
         "clarify": {
-            "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
+            "timeout": 120,  # Seconds of no user activity before AUTO clarify mode proceeds
+            "default_wait_mode": "wait",  # wait | auto
         },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
@@ -307,6 +308,8 @@ def load_cli_config() -> Dict[str, Any]:
             "provider": "",    # Subagent provider override (empty = inherit parent provider)
             "base_url": "",    # Direct OpenAI-compatible endpoint for subagents
             "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+            "watchdog_idle_seconds": 180,
+            "watchdog_same_tool_limit": 8,
         },
     }
     
@@ -1530,6 +1533,11 @@ class HermesCLI:
         _bim = CLI_CONFIG["display"].get("busy_input_mode", "interrupt")
         self.busy_input_mode = "queue" if str(_bim).strip().lower() == "queue" else "interrupt"
 
+        clarify_cfg = CLI_CONFIG.get("clarify", {}) or {}
+        self._clarify_auto_timeout_seconds = max(1, int(clarify_cfg.get("timeout", 120) or 120))
+        _clarify_mode = str(clarify_cfg.get("default_wait_mode", "wait") or "wait").strip().lower()
+        self._clarify_wait_mode_default = "auto" if _clarify_mode == "auto" else "wait"
+
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
@@ -1719,6 +1727,7 @@ class HermesCLI:
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._clarify_last_typing_at = 0.0
         self._sudo_state = None
         self._sudo_deadline = 0
         self._modal_input_snapshot = None
@@ -6091,6 +6100,13 @@ class HermesCLI:
         is doing during tool execution (fills the gap between thinking
         spinner and next response).  Also plays audio cue in voice mode.
         """
+        if event_type in ("subagent.heartbeat", "subagent.warning"):
+            marker = "⚠️" if event_type == "subagent.warning" else "💓"
+            label = preview or function_name or "subagent active"
+            self._spinner_text = f"{marker} {label}"
+            self._invalidate(min_interval=0)
+            return
+
         # Only act on tool.started; ignore tool.completed, reasoning.available, etc.
         if event_type != "tool.started":
             return
@@ -6103,7 +6119,7 @@ class HermesCLI:
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
-            self._invalidate()
+            self._invalidate(min_interval=0)
 
         if not self._voice_mode:
             return
@@ -6548,68 +6564,124 @@ class HermesCLI:
         for line in reqs["details"].split("\n"):
             _cprint(f"    {line}")
 
+    def _set_clarify_wait_mode(self, mode: str, *, persist: bool = True) -> str:
+        """Set the default clarify wait mode and optionally persist it."""
+        normalized = "auto" if str(mode or "").strip().lower() == "auto" else "wait"
+        self._clarify_wait_mode_default = normalized
+        if persist:
+            save_config_value("clarify.default_wait_mode", normalized)
+            try:
+                CLI_CONFIG.setdefault("clarify", {})["default_wait_mode"] = normalized
+            except Exception:
+                pass
+        if self._clarify_state is not None:
+            self._clarify_state["wait_mode"] = normalized
+            self._refresh_clarify_agent_wait_state()
+            self._invalidate(min_interval=0)
+        return normalized
+
+    def _refresh_clarify_agent_wait_state(self) -> None:
+        state = self._clarify_state or {}
+        agent = getattr(self, "agent", None)
+        if not agent or not hasattr(agent, "set_wait_state"):
+            return
+        if not state:
+            try:
+                agent.clear_wait_state()
+            except Exception:
+                pass
+            return
+        try:
+            typing_idle = max(0.0, time.monotonic() - float(self._clarify_last_typing_at or 0.0))
+            agent.set_wait_state(
+                "clarify",
+                mode=state.get("wait_mode") or self._clarify_wait_mode_default,
+                question_preview=str(state.get("question", ""))[:160],
+                choices_count=len(state.get("choices") or []),
+                typing_active=bool(self._clarify_freetext and self._app and self._app.current_buffer.text.strip()),
+                typing_idle_seconds=round(typing_idle, 1),
+            )
+        except Exception:
+            pass
+
     def _clarify_callback(self, question, choices):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
         Sets up the interactive selection UI (or freetext prompt for open-ended
         questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        key bindings. WAIT mode blocks indefinitely until the user responds or
+        cancels. AUTO mode proceeds after the configured idle timeout.
         """
         import time as _time
 
-        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+        timeout = self._clarify_auto_timeout_seconds
         response_queue = queue.Queue()
         is_open_ended = not choices
+        wait_mode = self._clarify_wait_mode_default
 
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
             "response_queue": response_queue,
+            "wait_mode": wait_mode,
         }
-        self._clarify_deadline = _time.monotonic() + timeout
+        self._clarify_last_typing_at = _time.monotonic()
+        self._clarify_deadline = (_time.monotonic() + timeout) if wait_mode == "auto" else 0
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
+        self._refresh_clarify_agent_wait_state()
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
-        self._invalidate()
+        self._invalidate(min_interval=0)
 
-        # Poll for the user's response.  The countdown in the hint line
-        # updates on each invalidate — but frequent repaints cause visible
-        # flicker in some terminals (Kitty, ghostty).  We only refresh the
-        # countdown every 5 s; selection changes (↑/↓) trigger instant
-        # Poll for the user's response.  The countdown in the hint line
-        # updates on each invalidate — but frequent repaints cause visible
-        # flicker in some terminals (Kitty, ghostty).  We only refresh the
-        # countdown every 5 s; selection changes (↑/↓) trigger instant
-        # repaints via the key bindings.
         _last_countdown_refresh = _time.monotonic()
         while True:
             try:
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = 0
+                self._clarify_state = None
+                self._clarify_freetext = False
+                self._refresh_clarify_agent_wait_state()
+                self._invalidate(min_interval=0)
                 return result
             except queue.Empty:
-                remaining = self._clarify_deadline - _time.monotonic()
-                if remaining <= 0:
-                    break
-                # Only repaint every 5 s for the countdown — avoids flicker
                 now = _time.monotonic()
-                if now - _last_countdown_refresh >= 5.0:
+                state = self._clarify_state or {}
+                active_mode = state.get("wait_mode", wait_mode)
+                if active_mode == "auto":
+                    if not self._clarify_deadline:
+                        self._clarify_deadline = now + timeout
+                    if self._clarify_freetext:
+                        draft_text = ""
+                        if getattr(self, "_app", None) and self._app.current_buffer:
+                            draft_text = self._app.current_buffer.text.strip()
+                        typing_active = bool(draft_text)
+                        if typing_active:
+                            self._clarify_last_typing_at = now
+                        idle_for = now - float(self._clarify_last_typing_at or now)
+                        self._refresh_clarify_agent_wait_state()
+                        if idle_for < timeout:
+                            if now - _last_countdown_refresh >= 1.0:
+                                _last_countdown_refresh = now
+                                self._invalidate(min_interval=0)
+                            continue
+                    remaining = self._clarify_deadline - now
+                    if remaining <= 0:
+                        break
+                if now - _last_countdown_refresh >= 1.0:
                     _last_countdown_refresh = now
-                    self._invalidate()
-                if now - _last_countdown_refresh >= 5.0:
-                    _last_countdown_refresh = now
-                    self._invalidate()
+                    self._refresh_clarify_agent_wait_state()
+                    self._invalidate(min_interval=0)
 
-        # Timed out — tear down the UI and let the agent decide
+        # AUTO timed out — tear down the UI and let the agent decide
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
-        self._invalidate()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        self._refresh_clarify_agent_wait_state()
+        self._invalidate(min_interval=0)
+        _cprint(f"\n{_DIM}(clarify AUTO mode timed out after {timeout}s of inactivity — agent will decide){_RST}")
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -7594,7 +7666,8 @@ class HermesCLI:
         # the prompt_toolkit UI switches to a selection mode.
         self._clarify_state = None      # dict with question, choices, selected, response_queue
         self._clarify_freetext = False  # True when user chose "Other" and is typing
-        self._clarify_deadline = 0      # monotonic timestamp when the clarify times out
+        self._clarify_deadline = 0      # monotonic timestamp when AUTO clarify mode proceeds
+        self._clarify_last_typing_at = 0.0
 
         # Sudo password prompt state (similar mechanism to clarify)
         self._sudo_state = None         # dict with response_queue when active
@@ -7695,6 +7768,8 @@ class HermesCLI:
                     self._clarify_state["response_queue"].put(text)
                     self._clarify_state = None
                     self._clarify_freetext = False
+                    self._clarify_deadline = 0
+                    self._refresh_clarify_agent_wait_state()
                     event.app.current_buffer.reset()
                     event.app.invalidate()
                 return
@@ -7707,10 +7782,14 @@ class HermesCLI:
                 if selected < len(choices):
                     state["response_queue"].put(choices[selected])
                     self._clarify_state = None
+                    self._clarify_deadline = 0
+                    self._refresh_clarify_agent_wait_state()
                     event.app.invalidate()
                 else:
                     # "Other" selected → switch to freetext
                     self._clarify_freetext = True
+                    self._clarify_last_typing_at = time.monotonic()
+                    self._refresh_clarify_agent_wait_state()
                     event.app.invalidate()
                 return
 
@@ -7806,6 +7885,16 @@ class HermesCLI:
                 self._clarify_state["selected"] = min(max_idx, self._clarify_state["selected"] + 1)
                 event.app.invalidate()
 
+        @kb.add('escape', 'a', filter=Condition(lambda: bool(self._clarify_state)))
+        def clarify_set_auto(event):
+            self._set_clarify_wait_mode("auto")
+            event.app.invalidate()
+
+        @kb.add('escape', 'w', filter=Condition(lambda: bool(self._clarify_state)))
+        def clarify_set_wait(event):
+            self._set_clarify_wait_mode("wait")
+            event.app.invalidate()
+
         # --- Dangerous command approval: arrow-key navigation ---
 
         @kb.add('up', filter=Condition(lambda: bool(self._approval_state)))
@@ -7899,6 +7988,8 @@ class HermesCLI:
                 )
                 self._clarify_state = None
                 self._clarify_freetext = False
+                self._clarify_deadline = 0
+                self._refresh_clarify_agent_wait_state()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
@@ -8163,6 +8254,11 @@ class HermesCLI:
         _paste_just_collapsed = [False]
 
         def _on_text_changed(buf):
+            if cli_ref._clarify_state and cli_ref._clarify_freetext:
+                cli_ref._clarify_last_typing_at = time.monotonic()
+                cli_ref._refresh_clarify_agent_wait_state()
+                cli_ref._invalidate(min_interval=0)
+
             """Detect large pastes and collapse them to a file reference.
 
             When bracketed paste is available, handle_paste collapses
@@ -8247,6 +8343,14 @@ class HermesCLI:
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
             if cli_ref._agent_running:
+                _agent = getattr(cli_ref, "agent", None)
+                if _agent and hasattr(_agent, "get_activity_summary"):
+                    try:
+                        _activity = _agent.get_activity_summary()
+                        if _activity.get("current_tool") == "delegate_task" and _activity.get("active_children_count"):
+                            return "type a message + Enter to interrupt and redirect delegation, Ctrl+C to cancel"
+                    except Exception:
+                        pass
                 return "type a message + Enter to interrupt, Ctrl+C to cancel"
             if cli_ref._voice_mode:
                 return "type or Ctrl+B to record"
@@ -8282,16 +8386,20 @@ class HermesCLI:
                 ]
 
             if cli_ref._clarify_state:
-                remaining = max(0, int(cli_ref._clarify_deadline - _time.monotonic()))
-                countdown = f'  ({remaining}s)' if cli_ref._clarify_deadline else ''
+                _mode = (cli_ref._clarify_state.get("wait_mode") or cli_ref._clarify_wait_mode_default).upper()
+                remaining = max(0, int(cli_ref._clarify_deadline - _time.monotonic())) if cli_ref._clarify_deadline else 0
+                countdown = f'  ({remaining}s idle)' if cli_ref._clarify_deadline else '  (waiting)'
+                mode_hint = f'  mode={_mode} · Esc+A auto · Esc+W wait'
                 if cli_ref._clarify_freetext:
                     return [
                         ('class:hint', '  type your answer and press Enter'),
                         ('class:clarify-countdown', countdown),
+                        ('class:hint', mode_hint),
                     ]
                 return [
                     ('class:hint', '  ↑/↓ to select, Enter to confirm'),
                     ('class:clarify-countdown', countdown),
+                    ('class:hint', mode_hint),
                 ]
 
             if cli_ref._command_running:
@@ -8375,14 +8483,15 @@ class HermesCLI:
                 else "  Other (type your answer)"
             )
             preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="  "))
-            box_width = _panel_box_width("Hermes needs your input", preview_lines)
+            title = f"Hermes needs your input · {(state.get('wait_mode') or cli_ref._clarify_wait_mode_default).upper()}"
+            box_width = _panel_box_width(title, preview_lines)
             inner_text_width = max(8, box_width - 2)
 
             lines = []
             # Box top border
             lines.append(('class:clarify-border', '╭─ '))
-            lines.append(('class:clarify-title', 'Hermes needs your input'))
-            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len("Hermes needs your input") - 3)) + '╮\n'))
+            lines.append(('class:clarify-title', title))
+            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
             _append_blank_panel_line(lines, 'class:clarify-border', box_width)
 
             # Question text

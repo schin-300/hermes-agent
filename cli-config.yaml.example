@@ -722,6 +722,13 @@ code_execution:
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
 
 # =============================================================================
+# Clarify prompts
+# =============================================================================
+clarify:
+  timeout: 120              # AUTO mode: seconds of no user activity before proceeding
+  default_wait_mode: wait   # wait | auto (CLI hotkeys: Esc+A auto, Esc+W wait)
+
+# =============================================================================
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.
@@ -729,6 +736,8 @@ code_execution:
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
   default_toolsets: ["terminal", "file", "web"]  # Default toolsets for subagents
+  watchdog_idle_seconds: 180                  # Interrupt a child that shows no activity for too long
+  watchdog_same_tool_limit: 8                 # Interrupt a child that repeats the same tool suspiciously often
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.

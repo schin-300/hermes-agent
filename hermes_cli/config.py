@@ -432,6 +432,12 @@ DEFAULT_CONFIG = {
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
     },
 
+    # Clarify prompt behavior
+    "clarify": {
+        "timeout": 120,               # Seconds of no user activity before AUTO clarify mode proceeds
+        "default_wait_mode": "wait",  # wait | auto
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
@@ -514,6 +520,8 @@ DEFAULT_CONFIG = {
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        "watchdog_idle_seconds": 180,
+        "watchdog_same_tool_limit": 8,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -600,7 +608,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 13,
+    "_config_version": 14,
 }
 
 # =============================================================================

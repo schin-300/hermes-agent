@@ -805,6 +805,105 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    async def _resolve_update_prompt_wait(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Adapter for detached /update prompts that are waiting for user input."""
+        update_prompts = getattr(self, "_update_prompt_pending", {})
+        if not update_prompts.get(session_key):
+            return False, None
+
+        raw = (event.text or "").strip()
+        cmd = event.get_command()
+        if cmd in ("approve", "yes"):
+            response_text = "y"
+        elif cmd in ("deny", "no"):
+            response_text = "n"
+        elif cmd == "answer":
+            response_text = event.get_command_args().strip()
+        else:
+            response_text = raw
+
+        if not response_text:
+            return True, "Usage: /answer <response>"
+
+        from utils import atomic_yaml_write
+        response_path = _hermes_home / ".update_response"
+        try:
+            atomic_yaml_write(response_path, {"response": response_text})
+        except Exception as e:
+            logger.warning("Failed to write update response: %s", e)
+            return True, f"✗ Failed to send response to update process: {e}"
+
+        update_prompts.pop(session_key, None)
+        label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
+        return True, f"✓ Sent `{label}` to the update process."
+
+    async def _resolve_approval_wait(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Adapter for dangerous-command approval waits."""
+        from hermes_cli.commands import resolve_command as _resolve_cmd
+        from tools.approval import has_blocking_approval
+
+        if not has_blocking_approval(session_key):
+            return False, None
+
+        cmd = event.get_command()
+        cmd_def = _resolve_cmd(cmd) if cmd else None
+        if not cmd_def:
+            return False, None
+        if cmd_def.name == "approve":
+            return True, await self._handle_approve_command(event)
+        if cmd_def.name == "deny":
+            return True, await self._handle_deny_command(event)
+        return False, None
+
+    async def _resolve_clarify_wait(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Adapter for blocked clarify prompts while an agent is running."""
+        from hermes_cli.commands import resolve_command as _resolve_cmd
+        from tools.clarify_tool import has_blocking_gateway_clarify, resolve_gateway_clarify
+
+        if not has_blocking_gateway_clarify(session_key):
+            return False, None
+
+        cmd = event.get_command()
+        cmd_def = _resolve_cmd(cmd) if cmd else None
+        response_text = None
+        if cmd_def and cmd_def.name == "answer":
+            response_text = event.get_command_args().strip()
+            if not response_text:
+                return True, "Usage: /answer <response>"
+        elif not cmd_def:
+            response_text = (event.text or "").strip()
+
+        if not response_text:
+            return False, None
+
+        count = resolve_gateway_clarify(session_key, response_text)
+        if not count:
+            return True, "No pending clarify question to answer."
+
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            adapter.resume_typing_for_chat(source.chat_id)
+        return True, "✅ Clarify response received. The agent is resuming..."
+
+    async def _try_handle_blocking_wait(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Shared blocked-wait dispatcher with small per-wait adapters.
+
+        This is the base path for user input that arrives while Hermes is paused
+        behind a blocking interaction. Each waiting flow contributes a small
+        adapter (`update`, `approval`, `clarify`) instead of open-coding command
+        handling in multiple branches.
+        """
+        for adapter in (
+            self._resolve_update_prompt_wait,
+            self._resolve_approval_wait,
+            self._resolve_clarify_wait,
+        ):
+            handled, response = await adapter(event, session_key)
+            if handled:
+                return True, response
+        return False, None
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
 
@@ -1503,6 +1602,8 @@ class GatewayRunner:
         self._running = False
 
         for session_key, agent in list(self._running_agents.items()):
+            from tools.clarify_tool import clear_gateway_clarify_session
+            clear_gateway_clarify_session(session_key)
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
@@ -1856,34 +1957,13 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
-        # Intercept messages that are responses to a pending /update prompt.
-        # The update process (detached) wrote .update_prompt.json; the watcher
-        # forwarded it to the user; now the user's reply goes back via
-        # .update_response so the update process can continue.
+        # Generic blocking-wait dispatch: detached update prompts, dangerous
+        # command approvals, and clarify waits all plug into the same base path
+        # through small adapters instead of open-coding bespoke command logic.
         _quick_key = self._session_key_for_source(source)
-        _update_prompts = getattr(self, "_update_prompt_pending", {})
-        if _update_prompts.get(_quick_key):
-            raw = (event.text or "").strip()
-            # Accept /approve and /deny as shorthand for yes/no
-            cmd = event.get_command()
-            if cmd in ("approve", "yes"):
-                response_text = "y"
-            elif cmd in ("deny", "no"):
-                response_text = "n"
-            else:
-                response_text = raw
-            if response_text:
-                response_path = _hermes_home / ".update_response"
-                try:
-                    tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text(response_text)
-                    tmp.replace(response_path)
-                except OSError as e:
-                    logger.warning("Failed to write update response: %s", e)
-                    return f"✗ Failed to send response to update process: {e}"
-                _update_prompts.pop(_quick_key, None)
-                label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
-                return f"✓ Sent `{label}` to the update process."
+        _wait_handled, _wait_response = await self._try_handle_blocking_wait(event, _quick_key)
+        if _wait_handled:
+            return _wait_response
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -1960,6 +2040,8 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Stop requested")
+                from tools.clarify_tool import clear_gateway_clarify_session
+                clear_gateway_clarify_session(_quick_key)
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -1981,6 +2063,8 @@ class GatewayRunner:
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Session reset requested")
+                from tools.clarify_tool import clear_gateway_clarify_session
+                clear_gateway_clarify_session(_quick_key)
                 # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -2012,15 +2096,6 @@ class GatewayRunner:
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
                 return "Agent is running — wait or /stop first, then switch models."
-
-            # /approve and /deny must bypass the running-agent interrupt path.
-            # The agent thread is blocked on a threading.Event inside
-            # tools/approval.py — sending an interrupt won't unblock it.
-            # Route directly to the approval handler so the event is signalled.
-            if _cmd_def_inner and _cmd_def_inner.name in ("approve", "deny"):
-                if _cmd_def_inner.name == "approve":
-                    return await self._handle_approve_command(event)
-                return await self._handle_deny_command(event)
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
@@ -2166,6 +2241,9 @@ class GatewayRunner:
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "answer":
+            return await self._handle_answer_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -3402,6 +3480,34 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    def _format_running_activity(self, activity: dict) -> list[str]:
+        if not activity:
+            return []
+        lines: list[str] = []
+        wait_state = activity.get("wait_state") or {}
+        if wait_state:
+            mode = str(wait_state.get("mode") or "wait").upper()
+            kind = str(wait_state.get("kind") or "waiting")
+            lines.append(f"**Waiting:** {kind} ({mode})")
+            question = str(wait_state.get("question_preview") or "").strip()
+            if question:
+                lines.append(f"**Wait Prompt:** {question}")
+        active_children = activity.get("active_children") or []
+        if active_children:
+            lines.append(f"**Delegate Children:** {len(active_children)}")
+            for idx, child in enumerate(active_children[:3], start=1):
+                desc = child.get("current_tool") or child.get("last_activity_desc") or "active"
+                idle = child.get("seconds_since_activity")
+                detail = f"{desc}" if idle is None else f"{desc} ({int(idle)}s idle)"
+                lines.append(f"  - child {idx}: {detail}")
+                if child.get("watchdog_reason"):
+                    lines.append(f"    watchdog: {child['watchdog_reason']}")
+        elif activity.get("current_tool"):
+            lines.append(f"**Current Tool:** {activity['current_tool']}")
+        if activity.get("last_activity_desc"):
+            lines.append(f"**Agent Activity:** {activity['last_activity_desc']}")
+        return lines
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         source = event.source
@@ -3411,7 +3517,14 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        running_agent = self._running_agents.get(session_key)
+        is_running = running_agent is not None
+        activity = {}
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL and hasattr(running_agent, "get_activity_summary"):
+            try:
+                activity = running_agent.get_activity_summary() or {}
+            except Exception:
+                activity = {}
 
         title = None
         if self._session_db:
@@ -3432,6 +3545,11 @@ class GatewayRunner:
             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Tokens:** {session_entry.total_tokens:,}",
             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
+        ])
+        activity_lines = self._format_running_activity(activity)
+        if activity_lines:
+            lines.extend(["", *activity_lines])
+        lines.extend([
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
@@ -3454,12 +3572,16 @@ class GatewayRunner:
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
+            from tools.clarify_tool import clear_gateway_clarify_session
+            clear_gateway_clarify_session(session_key)
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
             logger.info("HARD STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Force-stopped. The agent was still starting — session unlocked."
         if agent:
             agent.interrupt("Stop requested")
+            from tools.clarify_tool import clear_gateway_clarify_session
+            clear_gateway_clarify_session(session_key)
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
@@ -5562,6 +5684,28 @@ class GatewayRunner:
         logger.info("User denied %d dangerous command(s) via /deny", count)
         return f"❌ Command{'s' if count > 1 else ''} denied{count_msg}."
 
+    async def _handle_answer_command(self, event: MessageEvent) -> str:
+        """Handle /answer <response> — answer the oldest pending clarify question."""
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        from tools.clarify_tool import has_blocking_gateway_clarify, resolve_gateway_clarify
+
+        if not has_blocking_gateway_clarify(session_key):
+            return "No pending clarify question to answer."
+
+        response_text = event.get_command_args().strip()
+        if not response_text:
+            return "Usage: /answer <response>"
+
+        count = resolve_gateway_clarify(session_key, response_text)
+        if not count:
+            return "No pending clarify question to answer."
+
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+        return "✅ Clarify response received. The agent is resuming..."
+
     # Platforms where /update is allowed.  ACP, API server, and webhooks are
     # programmatic interfaces that should not trigger system updates.
     _UPDATE_ALLOWED_PLATFORMS = frozenset({
@@ -6391,6 +6535,11 @@ class GatewayRunner:
             if not progress_queue:
                 return
 
+            if event_type in ("subagent.heartbeat", "subagent.warning"):
+                msg = preview or tool_name or "subagent active"
+                progress_queue.put(msg)
+                return
+
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in ("tool.started",):
                 return
@@ -6639,6 +6788,64 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
+        def _clarify_notify_sync(clarify_data: dict) -> None:
+            if not _status_adapter:
+                return
+            question = str(clarify_data.get("question") or "").strip()
+            choices = list(clarify_data.get("choices") or [])
+            try:
+                _status_adapter.pause_typing_for_chat(_status_chat_id)
+            except Exception:
+                pass
+
+            lines = ["❓ Hermes needs your input:", question]
+            if choices:
+                lines.append("")
+                for idx, choice in enumerate(choices, start=1):
+                    lines.append(f"{idx}. {choice}")
+                lines.append("")
+                lines.append("Reply with `/answer <number or text>`.")
+            else:
+                lines.append("")
+                lines.append("Reply with `/answer <your text>`.")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _status_adapter.send(
+                        _status_chat_id,
+                        "\n".join(lines),
+                        metadata=_status_thread_metadata,
+                    ),
+                    _loop_for_step,
+                ).result(timeout=15)
+            except Exception as _e:
+                logger.debug("clarify notify error: %s", _e)
+
+        def _clarify_callback_sync(question: str, choices: list[str] | None) -> str:
+            from tools.clarify_tool import wait_for_gateway_clarify
+            _agent = agent_holder[0]
+            if _agent and hasattr(_agent, "set_wait_state"):
+                try:
+                    _agent.set_wait_state(
+                        "clarify",
+                        mode="wait",
+                        question_preview=str(question or "")[:160],
+                        choices_count=len(choices or []),
+                    )
+                except Exception:
+                    pass
+            try:
+                return wait_for_gateway_clarify(
+                    question=question,
+                    choices=choices,
+                    session_key=session_key,
+                )
+            finally:
+                if _agent and hasattr(_agent, "clear_wait_state"):
+                    try:
+                        _agent.clear_wait_state()
+                    except Exception:
+                        pass
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -6773,6 +6980,7 @@ class GatewayRunner:
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
+            agent.clarify_callback = _clarify_callback_sync
             agent.reasoning_config = reasoning_config
 
             # Background review delivery — send "💾 Memory updated" etc. to user
@@ -6874,6 +7082,10 @@ class GatewayRunner:
                 set_current_session_key,
                 unregister_gateway_notify,
             )
+            from tools.clarify_tool import (
+                register_gateway_clarify_notify,
+                unregister_gateway_clarify_notify,
+            )
 
             def _approval_notify_sync(approval_data: dict) -> None:
                 """Send the approval request to the user from the agent thread.
@@ -6946,9 +7158,11 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            register_gateway_clarify_notify(_approval_session_key, _clarify_notify_sync)
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
+                unregister_gateway_clarify_notify(_approval_session_key)
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
@@ -7147,7 +7361,12 @@ class GatewayRunner:
                     try:
                         _a = _agent_ref.get_activity_summary()
                         _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
+                        _wait = _a.get("wait_state") or {}
+                        if _wait:
+                            _parts.append(f"waiting: {_wait.get('kind', 'input')}")
+                        elif _a.get("active_children_count"):
+                            _parts.append(f"delegate children: {_a['active_children_count']}")
+                        elif _a.get("current_tool"):
                             _parts.append(f"running: {_a['current_tool']}")
                         else:
                             _parts.append(_a.get("last_activity_desc", ""))
@@ -7206,12 +7425,16 @@ class GatewayRunner:
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
                     _idle_secs = 0.0
+                    _act = {}
                     if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                         try:
                             _act = _agent_ref.get_activity_summary()
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
                         except Exception:
-                            pass
+                            _act = {}
+                    _wait_state = _act.get("wait_state") or {}
+                    if _wait_state.get("kind") == "clarify" and str(_wait_state.get("mode") or "wait").lower() == "wait":
+                        _idle_secs = 0.0
                     # Staged warning: fire once before escalating to full timeout.
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):

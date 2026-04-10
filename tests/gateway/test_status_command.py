@@ -209,3 +209,41 @@ async def test_status_command_bypasses_active_session_guard():
     assert "Agent Running" in sent[0]
     assert not interrupt_event.is_set(), "/status incorrectly triggered an agent interrupt"
     assert session_key not in adapter._pending_messages, "/status was incorrectly queued"
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_wait_and_delegate_activity():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-2",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = MagicMock()
+    running_agent.get_activity_summary.return_value = {
+        "wait_state": {
+            "kind": "clarify",
+            "mode": "wait",
+            "question_preview": "Which branch should I use?",
+        },
+        "active_children": [
+            {
+                "current_tool": "read_file",
+                "seconds_since_activity": 3,
+                "watchdog_reason": None,
+            }
+        ],
+        "last_activity_desc": "delegate child: read_file",
+        "current_tool": "delegate_task",
+    }
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Waiting:** clarify (WAIT)" in result
+    assert "**Wait Prompt:** Which branch should I use?" in result
+    assert "**Delegate Children:** 1" in result
