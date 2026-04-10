@@ -3659,6 +3659,37 @@ class AIAgent:
         if self._memory_store:
             self._memory_store.load_from_disk()
 
+    def _mirror_builtin_memory_write(self, action: str, target: str, content: str) -> None:
+        if not self._memory_manager or action not in ("add", "replace"):
+            return
+        try:
+            self._memory_manager.on_memory_write(action, target, content)
+        except Exception:
+            pass
+
+    def _handle_builtin_memory_tool(self, function_args: Dict[str, Any]) -> str:
+        from tools.memory_tool import memory_tool as _memory_tool
+
+        action = function_args.get("action")
+        target = function_args.get("target", "memory")
+        raw_result = _memory_tool(
+            action=action,
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            store=self._memory_store,
+        )
+
+        try:
+            parsed = json.loads(raw_result)
+        except Exception:
+            return raw_result
+
+        if parsed.get("success"):
+            self._mirror_builtin_memory_write(action or "", target, function_args.get("content", ""))
+
+        return raw_result
+
     def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
         """Convert chat-completions tool schemas to Responses function-tool schemas."""
         source_tools = tools if tools is not None else self.tools
