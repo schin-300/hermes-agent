@@ -462,6 +462,8 @@ class ProcessRegistry:
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished."""
         with self._lock:
+            if session.id in self._finished:
+                return
             self._running.pop(session.id, None)
             self._finished[session.id] = session
         self._write_checkpoint()

@@ -157,6 +157,30 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_move_to_finished_is_idempotent_for_notify_sessions(self, registry):
+        """A notify-on-complete process should enqueue only once even if finish is reported twice."""
+        s = _make_session(
+            sid="proc_dup",
+            notify_on_complete=True,
+            output="first output",
+            exit_code=-15,
+        )
+        s.exited = True
+        registry._running[s.id] = s
+
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+            s.output_buffer = "later output that should not trigger a second completion"
+            registry._move_to_finished(s)
+
+        completions = []
+        while not registry.completion_queue.empty():
+            completions.append(registry.completion_queue.get_nowait())
+
+        assert len(completions) == 1
+        assert completions[0]["session_id"] == "proc_dup"
+        assert completions[0]["exit_code"] == -15
+
 
 # =========================================================================
 # Checkpoint persistence
