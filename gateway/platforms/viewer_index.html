@@ -2,357 +2,662 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Hermes Visibility Layer</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #071018;
-      --panel: rgba(12, 21, 33, 0.92);
-      --panel-strong: rgba(16, 28, 45, 0.98);
-      --border: rgba(120, 194, 255, 0.18);
-      --text: #e9f5ff;
-      --muted: #8ba5be;
-      --accent: #66d9ff;
-      --accent-2: #b4ff7b;
-      --warning: #ffbe64;
-      --danger: #ff6b91;
-      --shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+      --bg: #17181c;
+      --bg-elevated: #1e2026;
+      --bg-panel: #23262d;
+      --bg-card: #2b2f36;
+      --bg-card-hover: #313640;
+      --bg-card-selected: #394152;
+      --border: rgba(255,255,255,0.08);
+      --text: #f2f3f5;
+      --muted: #b5bac1;
+      --subtle: #8b9098;
+      --accent: #5865f2;
+      --accent-soft: rgba(88,101,242,0.18);
+      --green: #57f287;
+      --amber: #f9a825;
+      --red: #ed4245;
+      --shadow: 0 18px 42px rgba(0,0,0,0.28);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
     * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: radial-gradient(circle at top, #0f1c2b 0%, var(--bg) 60%); color: var(--text); }
-    body { overflow: hidden; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: linear-gradient(180deg, #15161a 0%, #1a1c21 100%);
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    body {
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
 
     .app {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 360px;
-      grid-template-rows: auto auto minmax(0, 1fr) auto;
-      grid-template-areas:
-        "header header"
-        "legend sidebar"
-        "map sidebar"
-        "footer sidebar";
       height: 100vh;
-      gap: 14px;
-      padding: 16px;
+      max-width: 1120px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 12px;
+      padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) 12px;
     }
 
     .panel {
-      background: var(--panel);
+      background: rgba(31, 33, 39, 0.96);
       border: 1px solid var(--border);
-      border-radius: 18px;
+      border-radius: 20px;
       box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
+      backdrop-filter: blur(8px);
     }
 
     .header {
-      grid-area: header;
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .header-top {
       display: flex;
-      align-items: center;
       justify-content: space-between;
-      padding: 18px 22px;
+      align-items: flex-start;
+      gap: 12px;
     }
 
-    .title-stack h1 {
+    .title {
       margin: 0;
-      font-size: 1.4rem;
-      letter-spacing: 0.02em;
+      font-size: 1.15rem;
+      font-weight: 760;
+      line-height: 1.15;
     }
 
-    .title-stack p {
-      margin: 4px 0 0;
+    .subtitle {
+      margin: 6px 0 0;
       color: var(--muted);
-      font-size: 0.95rem;
+      font-size: 0.92rem;
+      line-height: 1.4;
+      max-width: 760px;
     }
 
-    .status-pill {
+    .connection {
+      flex: 0 0 auto;
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      padding: 10px 14px;
+      padding: 10px 12px;
       border-radius: 999px;
-      background: rgba(102, 217, 255, 0.08);
-      border: 1px solid rgba(102, 217, 255, 0.18);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      font-size: 0.86rem;
       color: var(--muted);
-      font-size: 0.92rem;
+      white-space: nowrap;
     }
 
-    .status-dot {
+    .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
-      background: var(--warning);
-      box-shadow: 0 0 14px currentColor;
+      background: var(--amber);
+      box-shadow: 0 0 12px currentColor;
+      color: var(--amber);
+      flex: 0 0 auto;
     }
 
-    .status-pill.live .status-dot { color: #75ff8b; background: #75ff8b; }
-    .status-pill.reconnecting .status-dot { color: var(--warning); background: var(--warning); }
-    .status-pill.error .status-dot { color: var(--danger); background: var(--danger); }
+    .connection.live .dot { color: var(--green); background: var(--green); }
+    .connection.error .dot { color: var(--red); background: var(--red); }
 
-    .legend {
-      grid-area: legend;
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      padding: 14px 16px;
-      align-items: center;
-    }
-
-    .chip {
-      min-width: 120px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: rgba(255, 255, 255, 0.02);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .chip-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .chip-value { margin-top: 5px; font-size: 1.15rem; font-weight: 650; }
-
-    .map-wrap {
-      grid-area: map;
-      position: relative;
-      overflow: hidden;
-      min-height: 0;
-    }
-
-    canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
-      border-radius: 18px;
-      background: linear-gradient(180deg, rgba(15, 24, 38, 0.95), rgba(7, 12, 20, 0.98));
-    }
-
-    .map-overlay {
-      position: absolute;
-      inset: 18px 18px auto auto;
-      padding: 10px 12px;
-      border-radius: 14px;
-      background: rgba(4, 10, 18, 0.75);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      color: var(--muted);
-      font-size: 0.88rem;
-    }
-
-    .sidebar {
-      grid-area: sidebar;
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
-      overflow: hidden;
-      background: var(--panel-strong);
-    }
-
-    .sidebar-section {
-      padding: 18px;
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-    }
-
-    .sidebar h2, .sidebar h3 {
-      margin: 0 0 10px;
-      font-size: 1rem;
-    }
-
-    .meta-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-
-    .meta-item {
-      padding: 10px 12px;
-      border-radius: 12px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.05);
-    }
-
-    .meta-item .label {
-      display: block;
-      color: var(--muted);
-      font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 6px;
-    }
-
-    .meta-item .value {
-      font-size: 0.92rem;
-      line-height: 1.35;
-      word-break: break-word;
-    }
-
-    .agent-list {
-      list-style: none;
-      margin: 0;
-      padding: 8px;
-      overflow: auto;
-      flex: 1;
-    }
-
-    .agent-card {
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 12px;
-      align-items: center;
-      padding: 12px;
-      margin-bottom: 8px;
-      border-radius: 14px;
-      cursor: pointer;
-      border: 1px solid transparent;
-      background: rgba(255,255,255,0.03);
-      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
-    }
-
-    .agent-card:hover, .agent-card.selected {
-      transform: translateY(-1px);
-      border-color: rgba(102, 217, 255, 0.3);
-      background: rgba(102, 217, 255, 0.08);
-    }
-
-    .sprite-dot {
-      width: 18px;
-      height: 18px;
-      border-radius: 6px;
-      box-shadow: 0 0 16px rgba(255,255,255,0.14);
-    }
-
-    .agent-name { font-weight: 650; }
-    .agent-sub { color: var(--muted); font-size: 0.86rem; margin-top: 3px; }
-    .agent-room { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; }
-
-    .footer {
-      grid-area: footer;
+    .header-bottom {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 12px 18px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .count-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .count-pill {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
       color: var(--muted);
+    }
+
+    .count-pill strong {
+      color: var(--text);
+      font-size: 0.98rem;
+      font-weight: 750;
+    }
+
+    .sync-label {
+      color: var(--subtle);
+      font-size: 0.82rem;
+    }
+
+    .content {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      gap: 12px;
+      overflow: hidden;
+    }
+
+    .agents-panel,
+    .focus-panel {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .agents-panel { padding: 14px; }
+    .focus-panel { padding: 16px; }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex: 0 0 auto;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .section-note {
+      color: var(--subtle);
+      font-size: 0.82rem;
+      text-align: right;
+    }
+
+    .agent-scroll {
+      min-height: 0;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .agent-card {
+      appearance: none;
+      position: relative;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: inherit;
+      border-radius: 18px;
+      padding: 12px 10px;
+      text-align: left;
+      min-height: 112px;
+      cursor: pointer;
+      transition: background 140ms ease, border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+
+    .agent-card:hover {
+      background: var(--bg-card-hover);
+      transform: translateY(-1px);
+    }
+
+    .agent-card.selected {
+      background:
+        linear-gradient(180deg, rgba(88,101,242,0.22), rgba(88,101,242,0.08)),
+        var(--bg-card-selected);
+      border-color: rgba(88,101,242,0.75);
+      box-shadow: 0 0 0 3px var(--accent-soft), inset 0 1px 0 rgba(255,255,255,0.06);
+    }
+
+    .selected-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 4px 7px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: white;
+      font-size: 0.64rem;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .agent-avatar {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      color: white;
+      font-size: 0.92rem;
+      font-weight: 800;
+      position: relative;
+      margin-bottom: 10px;
+    }
+
+    .agent-avatar-status {
+      position: absolute;
+      right: -1px;
+      bottom: -1px;
+      width: 13px;
+      height: 13px;
+      border-radius: 50%;
+      border: 3px solid var(--bg-card);
+      background: #7f848e;
+    }
+
+    .agent-avatar-status.running,
+    .agent-avatar-status.starting { background: var(--green); }
+    .agent-avatar-status.error,
+    .agent-avatar-status.failed { background: var(--red); }
+
+    .agent-name {
+      font-size: 0.84rem;
+      font-weight: 700;
+      line-height: 1.2;
+      margin-bottom: 6px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      min-height: 2.4em;
+    }
+
+    .agent-meta {
+      font-size: 0.73rem;
+      color: var(--muted);
+      line-height: 1.35;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .agent-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      align-self: flex-start;
+      padding: 4px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #e7e9ed;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .agent-state.running,
+    .agent-state.starting {
+      background: rgba(87,242,135,0.14);
+      border-color: rgba(87,242,135,0.35);
+      color: var(--green);
+    }
+
+    .agent-state.error,
+    .agent-state.failed {
+      background: rgba(237,66,69,0.16);
+      border-color: rgba(237,66,69,0.35);
+      color: #ff8a8d;
+    }
+
+    .agent-subline {
+      color: var(--subtle);
+      font-size: 0.7rem;
+    }
+
+    .focus-label {
+      color: var(--subtle);
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      margin-bottom: 10px;
+      flex: 0 0 auto;
+    }
+
+    .focus-top {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex: 0 0 auto;
+    }
+
+    .focus-avatar {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      color: white;
+      font-size: 1.1rem;
+      flex: 0 0 auto;
+    }
+
+    .focus-name {
+      margin: 0;
+      font-size: 1.08rem;
+      line-height: 1.2;
+      font-weight: 780;
+    }
+
+    .focus-sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.35;
+    }
+
+    .focus-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+      flex: 0 0 auto;
+    }
+
+    .chip {
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .chip strong {
+      color: var(--text);
+      font-weight: 700;
+      margin-left: 6px;
+    }
+
+    .focus-scroll {
+      min-height: 0;
+      overflow: auto;
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+      padding-right: 2px;
+    }
+
+    .detail-block {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+    }
+
+    .detail-title {
+      margin: 0 0 8px;
+      color: var(--subtle);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }
+
+    .detail-text {
+      margin: 0;
+      font-size: 0.92rem;
+      line-height: 1.48;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .detail-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .detail-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
       font-size: 0.86rem;
+      line-height: 1.35;
+    }
+
+    .detail-row .label {
+      color: var(--subtle);
+      flex: 0 0 84px;
+    }
+
+    .detail-row .value {
+      color: var(--text);
+      flex: 1 1 auto;
+      text-align: right;
+      word-break: break-word;
     }
 
     .empty {
       color: var(--muted);
-      padding: 18px;
+      font-size: 0.92rem;
       line-height: 1.5;
     }
 
-    .activity-text {
-      font-size: 0.96rem;
-      line-height: 1.5;
-      color: var(--text);
-      padding: 14px 16px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.05);
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0,0,0,0);
+      white-space: nowrap;
+      border: 0;
     }
 
-    code.inline {
-      padding: 2px 6px;
-      border-radius: 8px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.06);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 0.85em;
-    }
-
-    @media (max-width: 1100px) {
-      body { overflow: auto; }
-      .app {
-        height: auto;
-        min-height: 100vh;
+    @media (max-width: 980px) {
+      .content {
         grid-template-columns: 1fr;
-        grid-template-rows: auto auto minmax(460px, 60vh) auto auto;
-        grid-template-areas:
-          "header"
-          "legend"
-          "map"
-          "sidebar"
-          "footer";
+        grid-template-rows: minmax(0, 1fr) 300px;
       }
-      .sidebar { min-height: 520px; }
+    }
+
+    @media (max-width: 820px) {
+      .header-top {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .connection {
+        align-self: flex-start;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .agent-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .agent-card {
+        min-height: 104px;
+        padding: 10px 8px;
+        border-radius: 16px;
+      }
+
+      .agent-avatar {
+        width: 38px;
+        height: 38px;
+        margin-bottom: 8px;
+        font-size: 0.84rem;
+      }
+
+      .agent-avatar-status {
+        width: 12px;
+        height: 12px;
+      }
+
+      .agent-name {
+        font-size: 0.78rem;
+      }
+
+      .agent-meta {
+        font-size: 0.68rem;
+      }
+
+      .agent-state {
+        font-size: 0.64rem;
+      }
+
+      .content {
+        grid-template-rows: minmax(0, 1fr) 286px;
+      }
+
+      .focus-panel {
+        padding: 14px;
+      }
+
+      .focus-avatar {
+        width: 52px;
+        height: 52px;
+        font-size: 1rem;
+      }
+
+      .focus-name {
+        font-size: 1rem;
+      }
+
+      .focus-sub {
+        font-size: 0.84rem;
+      }
+    }
+
+    @media (max-width: 420px) {
+      .agent-grid {
+        gap: 8px;
+      }
+
+      .agent-card {
+        min-height: 98px;
+      }
+
+      .count-pill {
+        font-size: 0.74rem;
+      }
     }
   </style>
 </head>
 <body>
   <div class="app">
-    <section class="panel header">
-      <div class="title-stack">
-        <h1>Hermes Visibility Layer</h1>
-        <p>Browser-native observer for gateway-hosted agents. The map is just a window into runtime state — it does not own the agent core.</p>
+    <header class="panel header">
+      <div class="header-top">
+        <div>
+          <h1 class="title">Hermes Visibility Layer</h1>
+          <p class="subtitle">Simple mobile-style agent switchboard for gateway-hosted sessions. Tap an agent, focus it, and steer your attention fast.</p>
+        </div>
+        <div id="connection" class="connection">
+          <span class="dot"></span>
+          <span id="connection-label">Connecting…</span>
+        </div>
       </div>
-      <div id="connection-status" class="status-pill reconnecting">
-        <span class="status-dot"></span>
-        <span id="connection-label">Connecting…</span>
-      </div>
-    </section>
 
-    <section class="panel legend" id="counts"></section>
-
-    <section class="panel map-wrap">
-      <canvas id="world"></canvas>
-      <div class="map-overlay">Live map — click a sprite for close-up state</div>
-    </section>
-
-    <aside class="panel sidebar">
-      <div class="sidebar-section">
-        <h2>Selected agent</h2>
-        <div id="selected-summary" class="empty">Waiting for live snapshot…</div>
+      <div class="header-bottom">
+        <div id="count-strip" class="count-strip"></div>
+        <div id="sync-label" class="sync-label">Waiting for first snapshot</div>
       </div>
-      <div class="sidebar-section">
-        <h3>Activity</h3>
-        <div id="selected-activity" class="activity-text">No activity yet.</div>
-      </div>
-      <div class="sidebar-section" style="padding-bottom: 10px;">
-        <h3>Agents</h3>
-      </div>
-      <ul id="agent-list" class="agent-list"></ul>
-    </aside>
+    </header>
 
-    <footer class="panel footer">
-      <div>Source endpoints: <code class="inline">/api/viewer/agents</code> + <code class="inline">/api/viewer/events</code></div>
-      <div id="last-sync">Waiting for sync…</div>
-    </footer>
+    <main class="content">
+      <section class="panel agents-panel" aria-label="agents">
+        <div class="section-head">
+          <h2 class="section-title">Agents</h2>
+          <div class="section-note">Tap any card to change focus</div>
+        </div>
+        <div class="agent-scroll">
+          <div id="agent-grid" class="agent-grid"></div>
+        </div>
+      </section>
+
+      <aside class="panel focus-panel" aria-label="focused agent">
+        <div class="focus-label">Focused Agent</div>
+
+        <div class="focus-top">
+          <div id="focus-avatar" class="focus-avatar">?</div>
+          <div>
+            <h2 id="focus-name" class="focus-name">No agent selected</h2>
+            <div id="focus-sub" class="focus-sub">Tap an agent tile to pin focus.</div>
+          </div>
+        </div>
+
+        <div id="focus-chips" class="focus-chips"></div>
+
+        <div class="focus-scroll">
+          <div class="detail-block">
+            <h3 class="detail-title">Activity</h3>
+            <p id="focus-activity" class="detail-text">Waiting for live activity.</p>
+          </div>
+
+          <div class="detail-block">
+            <h3 class="detail-title">Details</h3>
+            <div id="focus-details" class="detail-list"></div>
+          </div>
+
+          <div class="detail-block">
+            <h3 class="detail-title">Preview</h3>
+            <p id="focus-preview" class="detail-text">/api/viewer/agents + /api/viewer/events</p>
+          </div>
+        </div>
+      </aside>
+    </main>
   </div>
+
+  <div class="sr-only">/api/viewer/agents /api/viewer/events</div>
 
   <script>
     const SNAPSHOT_ENDPOINT = '/api/viewer/agents';
     const EVENTS_ENDPOINT = '/api/viewer/events';
 
-    const rooms = [
-      { id: 'idle', label: 'Idle Grove', x: 0.04, y: 0.11, w: 0.28, h: 0.34, tint: '#173c59' },
-      { id: 'thinking', label: 'Thinking Atrium', x: 0.36, y: 0.08, w: 0.27, h: 0.36, tint: '#3b2258' },
-      { id: 'tools', label: 'Tool Forge', x: 0.67, y: 0.11, w: 0.28, h: 0.34, tint: '#4f3c16' },
-      { id: 'archive', label: 'Archive Dock', x: 0.08, y: 0.56, w: 0.38, h: 0.28, tint: '#183327' },
-      { id: 'error', label: 'Red Zone', x: 0.56, y: 0.56, w: 0.30, h: 0.28, tint: '#4d1e2d' },
-    ];
-
-    const canvas = document.getElementById('world');
-    const ctx = canvas.getContext('2d');
-    const countsEl = document.getElementById('counts');
-    const agentListEl = document.getElementById('agent-list');
-    const selectedSummaryEl = document.getElementById('selected-summary');
-    const selectedActivityEl = document.getElementById('selected-activity');
-    const connectionStatusEl = document.getElementById('connection-status');
+    const countStripEl = document.getElementById('count-strip');
+    const gridEl = document.getElementById('agent-grid');
+    const syncLabelEl = document.getElementById('sync-label');
+    const connectionEl = document.getElementById('connection');
     const connectionLabelEl = document.getElementById('connection-label');
-    const lastSyncEl = document.getElementById('last-sync');
+    const focusAvatarEl = document.getElementById('focus-avatar');
+    const focusNameEl = document.getElementById('focus-name');
+    const focusSubEl = document.getElementById('focus-sub');
+    const focusChipsEl = document.getElementById('focus-chips');
+    const focusActivityEl = document.getElementById('focus-activity');
+    const focusDetailsEl = document.getElementById('focus-details');
+    const focusPreviewEl = document.getElementById('focus-preview');
 
     const state = {
       snapshot: null,
       agents: [],
       selectedId: null,
-      positions: new Map(),
-      hitboxes: [],
-      lastUpdateAt: 0,
       stream: null,
-      fallbackTimer: null,
-      lastPayload: null,
+      pollTimer: null,
     };
 
-    function setConnectionState(mode, label) {
-      connectionStatusEl.className = `status-pill ${mode}`;
+    function setConnection(mode, label) {
+      connectionEl.className = `connection ${mode}`.trim();
       connectionLabelEl.textContent = label;
     }
 
@@ -365,257 +670,164 @@
       return (hash >>> 0) / 4294967295;
     }
 
-    function colorForAgent(agent) {
-      const hue = Math.floor(seededNumber(agent.id, 17) * 360);
-      return `hsl(${hue}deg 86% 67%)`;
+    function avatarColor(agent) {
+      const hue = Math.floor(seededNumber(agent.id, 19) * 360);
+      return `linear-gradient(135deg, hsl(${hue} 72% 58%), hsl(${(hue + 32) % 360} 78% 52%))`;
     }
 
-    function roomById(id) {
-      return rooms.find((room) => room.id === id) || rooms[0];
+    function statusClass(agent) {
+      return String(agent.status || 'idle');
+    }
+
+    function initialsFor(agent) {
+      const raw = String(agent.display_name || agent.title || agent.session_id || 'H').trim();
+      const words = raw.split(/\s+/).filter(Boolean);
+      if (!words.length) return 'H';
+      if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+      return (words[0][0] + words[1][0]).toUpperCase();
     }
 
     function formatAgo(seconds) {
       if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return 'n/a';
-      const total = Math.max(0, Number(seconds));
-      if (total < 2) return 'just now';
-      if (total < 60) return `${Math.round(total)}s ago`;
-      if (total < 3600) return `${Math.round(total / 60)}m ago`;
-      return `${Math.round(total / 3600)}h ago`;
+      const value = Math.max(0, Number(seconds));
+      if (value < 2) return 'just now';
+      if (value < 60) return `${Math.round(value)}s ago`;
+      if (value < 3600) return `${Math.round(value / 60)}m ago`;
+      return `${Math.round(value / 3600)}h ago`;
     }
 
-    function formatTimestamp(ts) {
+    function formatClock(ts) {
       if (!ts) return 'n/a';
       return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function primaryMeta(agent) {
+      if (agent.current_tool) return agent.current_tool;
+      return String(agent.status || 'idle');
+    }
+
+    function secondaryMeta(agent) {
+      if (agent.seconds_since_activity !== null && agent.seconds_since_activity !== undefined) {
+        return formatAgo(agent.seconds_since_activity);
+      }
+      if (agent.updated_at) {
+        return `seen ${formatClock(agent.updated_at)}`;
+      }
+      return agent.source || 'waiting';
     }
 
     function renderCounts(snapshot) {
       const counts = snapshot?.counts || { total: 0, running: 0, idle: 0, error: 0 };
       const items = [
-        ['Visible agents', counts.total],
+        ['Visible', counts.total],
         ['Running', counts.running],
         ['Idle', counts.idle],
         ['Errors', counts.error],
       ];
-      countsEl.innerHTML = items.map(([label, value]) => `
-        <div class="chip">
-          <div class="chip-label">${label}</div>
-          <div class="chip-value">${value}</div>
-        </div>
+      countStripEl.innerHTML = items.map(([label, value]) => `
+        <div class="count-pill">${label}<strong>${value}</strong></div>
       `).join('');
     }
 
-    function renderAgentList() {
+    function renderGrid() {
       if (!state.agents.length) {
-        agentListEl.innerHTML = '<li class="empty">No live or recently active gateway agents found.</li>';
+        gridEl.innerHTML = '<div class="empty">No agents are visible yet.</div>';
         return;
       }
 
-      agentListEl.innerHTML = '';
+      gridEl.innerHTML = '';
       state.agents.forEach((agent) => {
-        const li = document.createElement('li');
-        li.className = `agent-card${agent.id === state.selectedId ? ' selected' : ''}`;
-        li.dataset.agentId = agent.id;
-        li.innerHTML = `
-          <span class="sprite-dot" style="background:${colorForAgent(agent)}"></span>
-          <div>
-            <div class="agent-name">${agent.display_name || agent.session_id}</div>
-            <div class="agent-sub">${agent.activity || 'waiting'} · ${formatAgo(agent.seconds_since_activity)}</div>
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `agent-card${agent.id === state.selectedId ? ' selected' : ''}`;
+        button.innerHTML = `
+          ${agent.id === state.selectedId ? '<div class="selected-badge">Focused</div>' : ''}
+          <div class="agent-avatar" style="background:${avatarColor(agent)}">
+            ${escapeHtml(initialsFor(agent))}
+            <span class="agent-avatar-status ${escapeHtml(statusClass(agent))}"></span>
           </div>
-          <div class="agent-room">${agent.room || 'idle'}</div>
+          <div class="agent-name">${escapeHtml(agent.display_name || agent.session_id)}</div>
+          <div class="agent-meta">
+            <span class="agent-state ${escapeHtml(statusClass(agent))}">${escapeHtml(primaryMeta(agent))}</span>
+            <span class="agent-subline">${escapeHtml(secondaryMeta(agent))}</span>
+          </div>
         `;
-        li.addEventListener('click', () => selectAgent(agent.id));
-        agentListEl.appendChild(li);
+        button.addEventListener('click', () => selectAgent(agent.id));
+        gridEl.appendChild(button);
       });
     }
 
-    function renderSelected() {
+    function renderFocus() {
       const agent = state.agents.find((item) => item.id === state.selectedId) || null;
       if (!agent) {
-        selectedSummaryEl.innerHTML = '<div class="empty">Select a sprite or wait for the first live snapshot.</div>';
-        selectedActivityEl.textContent = 'No activity yet.';
+        focusAvatarEl.style.background = 'linear-gradient(135deg, #5b5f66, #43474d)';
+        focusAvatarEl.textContent = '?';
+        focusNameEl.textContent = 'No agent selected';
+        focusSubEl.textContent = 'Tap an agent tile to pin focus.';
+        focusChipsEl.innerHTML = '';
+        focusActivityEl.textContent = 'Waiting for live activity.';
+        focusDetailsEl.innerHTML = '<div class="empty">Agent details will appear here.</div>';
+        focusPreviewEl.textContent = '/api/viewer/agents + /api/viewer/events';
         return;
       }
 
-      selectedSummaryEl.innerHTML = `
-        <div class="meta-grid">
-          <div class="meta-item"><span class="label">Name</span><span class="value">${agent.display_name || agent.session_id}</span></div>
-          <div class="meta-item"><span class="label">Status</span><span class="value">${agent.status}</span></div>
-          <div class="meta-item"><span class="label">Source</span><span class="value">${agent.source || 'unknown'}</span></div>
-          <div class="meta-item"><span class="label">Room</span><span class="value">${agent.room || 'idle'}</span></div>
-          <div class="meta-item"><span class="label">Model</span><span class="value">${agent.model || 'n/a'}</span></div>
-          <div class="meta-item"><span class="label">Current Tool</span><span class="value">${agent.current_tool || 'n/a'}</span></div>
-          <div class="meta-item"><span class="label">Session ID</span><span class="value"><code class="inline">${agent.session_id || 'n/a'}</code></span></div>
-          <div class="meta-item"><span class="label">Last seen</span><span class="value">${formatTimestamp(agent.updated_at)}</span></div>
-          <div class="meta-item"><span class="label">Messages</span><span class="value">${agent.message_count ?? 'n/a'}</span></div>
-          <div class="meta-item"><span class="label">Tokens</span><span class="value">${agent.tokens ?? 0}</span></div>
-          <div class="meta-item" style="grid-column:1/-1;"><span class="label">Preview</span><span class="value">${agent.preview || agent.title || '—'}</span></div>
-        </div>
-      `;
+      focusAvatarEl.style.background = avatarColor(agent);
+      focusAvatarEl.textContent = initialsFor(agent);
+      focusNameEl.textContent = agent.display_name || agent.session_id;
+      focusSubEl.textContent = `${String(agent.status || 'idle').toUpperCase()} • ${agent.source || 'unknown'} • ${formatAgo(agent.seconds_since_activity)}`;
 
-      selectedActivityEl.textContent = agent.activity || 'Waiting for input';
+      const chips = [
+        ['Room', agent.room || 'n/a'],
+        ['Tool', agent.current_tool || 'none'],
+        ['Model', agent.model || 'n/a'],
+      ];
+      focusChipsEl.innerHTML = chips.map(([label, value]) => `<div class="chip">${escapeHtml(label)}<strong>${escapeHtml(String(value))}</strong></div>`).join('');
+
+      focusActivityEl.textContent = agent.activity || 'Waiting for input';
+
+      const details = [
+        ['Session', agent.session_id || 'n/a'],
+        ['Messages', agent.message_count ?? 'n/a'],
+        ['Tokens', agent.tokens ?? 0],
+        ['Last Seen', formatClock(agent.updated_at)],
+        ['Started', formatClock(agent.started_at)],
+        ['Title', agent.title || '—'],
+      ];
+      focusDetailsEl.innerHTML = details.map(([label, value]) => `
+        <div class="detail-row">
+          <span class="label">${escapeHtml(label)}</span>
+          <span class="value">${escapeHtml(String(value))}</span>
+        </div>
+      `).join('');
+
+      focusPreviewEl.textContent = agent.preview || agent.title || 'No transcript preview available.';
     }
 
     function selectAgent(id) {
       state.selectedId = id;
-      renderAgentList();
-      renderSelected();
+      renderGrid();
+      renderFocus();
     }
 
-    function computeTarget(agent, indexWithinRoom, roomCount) {
-      const room = roomById(agent.room || 'idle');
-      const cols = Math.max(1, Math.ceil(Math.sqrt(roomCount)));
-      const rows = Math.max(1, Math.ceil(roomCount / cols));
-      const col = indexWithinRoom % cols;
-      const row = Math.floor(indexWithinRoom / cols);
-      const baseX = room.x + 0.08 * room.w;
-      const baseY = room.y + 0.18 * room.h;
-      const stepX = (room.w * 0.78) / Math.max(cols, 1);
-      const stepY = (room.h * 0.62) / Math.max(rows, 1);
-      const jitterX = (seededNumber(agent.id, 91) - 0.5) * stepX * 0.28;
-      const jitterY = (seededNumber(agent.id, 191) - 0.5) * stepY * 0.28;
-      return {
-        x: baseX + (col + 0.5) * stepX + jitterX,
-        y: baseY + (row + 0.5) * stepY + jitterY,
-      };
-    }
-
-    function drawSprite(x, y, size, color, selected, agent) {
-      const px = size / 8;
-      ctx.save();
-      ctx.translate(x, y + Math.sin((performance.now() / 700) + seededNumber(agent.id, 5) * Math.PI * 2) * 4);
-      ctx.shadowColor = color;
-      ctx.shadowBlur = selected ? 20 : 10;
-      ctx.fillStyle = color;
-
-      ctx.globalAlpha = 0.2;
-      ctx.beginPath();
-      ctx.ellipse(0, size * 0.85, size * 0.68, size * 0.28, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-
-      const blocks = [
-        [-1, -3], [0, -3],
-        [-2, -2], [-1, -2], [0, -2], [1, -2],
-        [-2, -1], [-1, -1], [0, -1], [1, -1],
-        [-1, 0], [0, 0],
-        [-2, 1], [-1, 1], [0, 1], [1, 1],
-        [-2, 2], [1, 2],
-      ];
-      blocks.forEach(([bx, by]) => ctx.fillRect(bx * px, by * px, px * 0.95, px * 0.95));
-
-      ctx.fillStyle = '#03111b';
-      ctx.fillRect(-px, -px, px * 0.8, px * 0.8);
-      ctx.fillRect(px * 0.2, -px, px * 0.8, px * 0.8);
-
-      if (selected) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.82)';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(-3.2 * px, -4.2 * px, 6.4 * px, 8.2 * px);
-      }
-      ctx.restore();
-    }
-
-    function draw() {
-      const { width, height } = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const pixelWidth = Math.max(1, Math.floor(width * dpr));
-      const pixelHeight = Math.max(1, Math.floor(height * dpr));
-      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
-        canvas.width = pixelWidth;
-        canvas.height = pixelHeight;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      }
-
-      ctx.clearRect(0, 0, width, height);
-      ctx.fillStyle = '#060c12';
-      ctx.fillRect(0, 0, width, height);
-
-      for (let i = 0; i < 90; i += 1) {
-        const x = seededNumber(`star-${i}`, 11) * width;
-        const y = seededNumber(`star-${i}`, 29) * height;
-        const alpha = 0.1 + seededNumber(`star-${i}`, 37) * 0.35;
-        ctx.fillStyle = `rgba(171, 227, 255, ${alpha})`;
-        ctx.fillRect(x, y, 2, 2);
-      }
-
-      rooms.forEach((room) => {
-        const x = room.x * width;
-        const y = room.y * height;
-        const w = room.w * width;
-        const h = room.h * height;
-        const gradient = ctx.createLinearGradient(x, y, x + w, y + h);
-        gradient.addColorStop(0, `${room.tint}cc`);
-        gradient.addColorStop(1, `${room.tint}55`);
-        ctx.fillStyle = gradient;
-        ctx.strokeStyle = 'rgba(170, 225, 255, 0.1)';
-        ctx.lineWidth = 1.4;
-        roundRect(ctx, x, y, w, h, 22, true, true);
-        ctx.fillStyle = 'rgba(235, 248, 255, 0.9)';
-        ctx.font = '600 16px Inter, sans-serif';
-        ctx.fillText(room.label, x + 18, y + 28);
-      });
-
-      const grouped = new Map();
-      state.agents.forEach((agent) => {
-        const room = agent.room || 'idle';
-        if (!grouped.has(room)) grouped.set(room, []);
-        grouped.get(room).push(agent);
-      });
-
-      state.hitboxes = [];
-      grouped.forEach((agentsInRoom) => {
-        agentsInRoom.forEach((agent, index) => {
-          const target = computeTarget(agent, index, agentsInRoom.length);
-          const existing = state.positions.get(agent.id) || target;
-          const next = {
-            x: existing.x + (target.x - existing.x) * 0.12,
-            y: existing.y + (target.y - existing.y) * 0.12,
-          };
-          state.positions.set(agent.id, next);
-          const px = next.x * width;
-          const py = next.y * height;
-          const size = 36;
-          drawSprite(px, py, size, colorForAgent(agent), agent.id === state.selectedId, agent);
-          ctx.fillStyle = 'rgba(232, 245, 255, 0.92)';
-          ctx.font = '500 12px Inter, sans-serif';
-          ctx.fillText(agent.display_name || agent.session_id, px + 22, py + 6);
-          ctx.fillStyle = 'rgba(139, 165, 190, 0.92)';
-          ctx.font = '400 10px Inter, sans-serif';
-          ctx.fillText(agent.current_tool || agent.status, px + 22, py + 20);
-          state.hitboxes.push({ id: agent.id, x: px - 18, y: py - 20, w: 170, h: 44 });
-        });
-      });
-    }
-
-    function roundRect(context, x, y, w, h, radius, fill, stroke) {
-      const r = Math.min(radius, w / 2, h / 2);
-      context.beginPath();
-      context.moveTo(x + r, y);
-      context.arcTo(x + w, y, x + w, y + h, r);
-      context.arcTo(x + w, y + h, x, y + h, r);
-      context.arcTo(x, y + h, x, y, r);
-      context.arcTo(x, y, x + w, y, r);
-      context.closePath();
-      if (fill) context.fill();
-      if (stroke) context.stroke();
-    }
-
-    function animationLoop() {
-      draw();
-      requestAnimationFrame(animationLoop);
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     function applySnapshot(snapshot) {
       state.snapshot = snapshot;
-      state.agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
-      state.lastUpdateAt = Date.now();
+      state.agents = Array.isArray(snapshot?.agents) ? snapshot.agents.slice() : [];
       renderCounts(snapshot);
-      renderAgentList();
       if (!state.selectedId || !state.agents.some((agent) => agent.id === state.selectedId)) {
         state.selectedId = state.agents[0]?.id || null;
       }
-      renderSelected();
-      lastSyncEl.textContent = `Last sync ${new Date().toLocaleTimeString()}`;
+      renderGrid();
+      renderFocus();
+      syncLabelEl.textContent = `Last sync ${new Date().toLocaleTimeString()}`;
     }
 
     async function fetchSnapshot() {
@@ -624,80 +836,68 @@
       return resp.json();
     }
 
-    function startFallbackPolling() {
-      if (state.fallbackTimer) return;
-      state.fallbackTimer = window.setInterval(async () => {
+    function startPollingFallback() {
+      if (state.pollTimer) return;
+      state.pollTimer = window.setInterval(async () => {
         try {
-          const snapshot = await fetchSnapshot();
-          applySnapshot(snapshot);
-          setConnectionState('reconnecting', 'Polling fallback');
+          applySnapshot(await fetchSnapshot());
+          setConnection('live', 'Polling fallback');
         } catch (error) {
           console.error(error);
-          setConnectionState('error', 'Viewer offline');
+          setConnection('error', 'Viewer offline');
         }
       }, 5000);
     }
 
-    function stopFallbackPolling() {
-      if (!state.fallbackTimer) return;
-      clearInterval(state.fallbackTimer);
-      state.fallbackTimer = null;
+    function stopPollingFallback() {
+      if (!state.pollTimer) return;
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
     }
 
     function connectStream() {
       if (state.stream) {
         state.stream.close();
       }
-      stopFallbackPolling();
-      setConnectionState('reconnecting', 'Connecting to gateway');
+      stopPollingFallback();
+      setConnection('', 'Connecting…');
       const stream = new EventSource(EVENTS_ENDPOINT);
       state.stream = stream;
+
       stream.onmessage = (event) => {
         try {
-          const snapshot = JSON.parse(event.data);
-          state.lastPayload = event.data;
-          applySnapshot(snapshot);
-          setConnectionState('live', 'Live SSE stream');
+          applySnapshot(JSON.parse(event.data));
+          setConnection('live', 'Live');
         } catch (error) {
-          console.error('bad viewer payload', error);
+          console.error('viewer payload error', error);
         }
       };
+
       stream.onerror = async () => {
-        setConnectionState('reconnecting', 'Reconnecting…');
+        setConnection('', 'Reconnecting…');
         try {
-          const snapshot = await fetchSnapshot();
-          applySnapshot(snapshot);
+          applySnapshot(await fetchSnapshot());
         } catch (error) {
           console.error(error);
         }
         stream.close();
         state.stream = null;
-        startFallbackPolling();
+        startPollingFallback();
         window.setTimeout(connectStream, 2500);
       };
     }
 
-    canvas.addEventListener('click', (event) => {
-      const rect = canvas.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      const hit = state.hitboxes.find((item) => x >= item.x && x <= item.x + item.w && y >= item.y && y <= item.y + item.h);
-      if (hit) {
-        selectAgent(hit.id);
-      }
-    });
-
-    window.addEventListener('resize', () => draw());
-
     (async function init() {
+      renderCounts({ counts: { total: 0, running: 0, idle: 0, error: 0 } });
+      renderGrid();
+      renderFocus();
       try {
-        const snapshot = await fetchSnapshot();
-        applySnapshot(snapshot);
+        applySnapshot(await fetchSnapshot());
+        setConnection('live', 'Live');
       } catch (error) {
         console.error(error);
-        setConnectionState('reconnecting', 'Initial snapshot unavailable');
+        setConnection('', 'Initial snapshot unavailable');
       }
-      animationLoop();
       connectStream();
     }());
   </script>
