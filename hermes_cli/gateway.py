@@ -222,6 +222,51 @@ def stop_profile_gateway() -> bool:
     return True
 
 
+def launch_gateway_background() -> bool:
+    """Launch the current profile's gateway as a detached background process."""
+    try:
+        from gateway.status import get_running_pid
+        if get_running_pid() is not None:
+            return True
+    except Exception:
+        pass
+
+    logs_dir = get_hermes_home() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "gateway-autostart.log"
+    log_handle = open(log_path, "a", encoding="utf-8")
+
+    cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--replace", "--quiet"]
+    env = os.environ.copy()
+    popen_kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_handle,
+        "stderr": log_handle,
+        "env": env,
+        "cwd": str(PROJECT_ROOT),
+        "close_fds": True,
+    }
+
+    if is_windows():
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if detached:
+            popen_kwargs["creationflags"] = detached
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen(cmd, **popen_kwargs)
+        log_handle.close()
+        return True
+    except Exception:
+        try:
+            log_handle.close()
+        except Exception:
+            pass
+        print_warning(f"Could not auto-start the gateway in background. See {log_path}")
+        return False
+
+
 def is_linux() -> bool:
     return sys.platform.startswith('linux')
 
@@ -2190,7 +2235,7 @@ def gateway_command(args):
             print("Not supported on this platform.")
             sys.exit(1)
     
-    elif subcmd == "stop":
+    elif subcmd in {"stop", "close"}:
         stop_all = getattr(args, 'all', False)
         system = getattr(args, 'system', False)
 

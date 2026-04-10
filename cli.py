@@ -1494,6 +1494,7 @@ class HermesCLI:
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        gateway_session_mode: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -1513,6 +1514,7 @@ class HermesCLI:
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        self.gateway_session_mode = bool(gateway_session_mode)
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -1712,6 +1714,7 @@ class HermesCLI:
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
         self._should_exit = False
+        self._detaching_gateway_session = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
         self._clarify_freetext = False
@@ -1749,6 +1752,20 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+
+    def _detach_gateway_session_and_exit(self, event, *, message: str) -> bool:
+        """Detach this terminal client from a gateway-hosted session without cancelling it."""
+        if not (self.gateway_session_mode and self._agent_running and self.agent and hasattr(self.agent, "detach")):
+            return False
+        self._detaching_gateway_session = True
+        self._should_exit = True
+        print(f"\n{message}")
+        try:
+            self.agent.detach()
+        except Exception:
+            logger.debug("Failed to detach gateway session cleanly", exc_info=True)
+        event.app.exit()
+        return True
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -2672,47 +2689,86 @@ class HermesCLI:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
-            self.agent = AIAgent(
-                model=effective_model,
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"),
-                credential_pool=runtime.get("credential_pool"),
-                max_iterations=self.max_turns,
-                enabled_toolsets=self.enabled_toolsets,
-                verbose_logging=self.verbose,
-                quiet_mode=not self.verbose,
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
-                service_tier=self.service_tier,
-                request_overrides=request_overrides,
-                providers_allowed=self._providers_only,
-                providers_ignored=self._providers_ignore,
-                providers_order=self._providers_order,
-                provider_sort=self._provider_sort,
-                provider_require_parameters=self._provider_require_params,
-                provider_data_collection=self._provider_data_collection,
-                session_id=self.session_id,
-                platform="cli",
-                session_db=self._session_db,
-                clarify_callback=self._clarify_callback,
-                reasoning_callback=self._current_reasoning_callback(),
+            if self.gateway_session_mode:
+                from hermes_cli.gateway_session_client import (
+                    GatewaySessionAgentProxy,
+                    ensure_gateway_session_bridge,
+                )
 
-                fallback_model=self._fallback_model,
-                thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
-                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                pass_session_id=self.pass_session_id,
-                tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-            )
+                endpoint = ensure_gateway_session_bridge()
+
+                self.agent = GatewaySessionAgentProxy(
+                    endpoint=endpoint,
+                    session_id=self.session_id,
+                    model=effective_model,
+                    provider=runtime.get("provider"),
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    api_mode=runtime.get("api_mode"),
+                    enabled_toolsets=self.enabled_toolsets,
+                    service_tier=self.service_tier,
+                    context_length_override=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    tool_progress_callback=self._on_tool_progress,
+                    reasoning_callback=self._current_reasoning_callback(),
+                )
+            else:
+                self.agent = AIAgent(
+                    model=effective_model,
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    provider=runtime.get("provider"),
+                    api_mode=runtime.get("api_mode"),
+                    acp_command=runtime.get("command"),
+                    acp_args=runtime.get("args"),
+                    credential_pool=runtime.get("credential_pool"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    prefill_messages=self.prefill_messages or None,
+                    reasoning_config=self.reasoning_config,
+                    service_tier=self.service_tier,
+                    request_overrides=request_overrides,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    session_id=self.session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    clarify_callback=self._clarify_callback,
+                    reasoning_callback=self._current_reasoning_callback(),
+                    fallback_model=self._fallback_model,
+                    thinking_callback=self._on_thinking,
+                    checkpoints_enabled=self.checkpoints_enabled,
+                    checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+                    pass_session_id=self.pass_session_id,
+                    tool_progress_callback=self._on_tool_progress,
+                    tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
+                    tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
+                    stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                    tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+                )
+                self._set_session_context_profile(
+                    context_length=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                )
+                try:
+                    local_store = getattr(self, "_local_todo_store", None)
+                    if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
+                        seed_items = local_store.read()
+                        if seed_items and not self.agent._todo_store.has_items():
+                            self.agent._todo_store.write(seed_items, merge=False)
+                except Exception:
+                    pass
+
             # Store reference for atexit memory provider shutdown
             global _active_agent_ref
             _active_agent_ref = self.agent
@@ -7072,6 +7128,9 @@ class HermesCLI:
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
+            if result and result.get("detached"):
+                return None
+
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
@@ -7825,6 +7884,11 @@ class HermesCLI:
                 return
 
             if self._agent_running and self.agent:
+                if self._detach_gateway_session_and_exit(
+                    event,
+                    message="⚡ Detaching from gateway-hosted session...",
+                ):
+                    return
                 if now - self._last_ctrl_c_time < 2.0:
                     print("\n⚡ Force exiting...")
                     self._should_exit = True
@@ -7848,6 +7912,11 @@ class HermesCLI:
         @kb.add('c-d')
         def handle_ctrl_d(event):
             """Handle Ctrl+D - exit."""
+            if self._detach_gateway_session_and_exit(
+                event,
+                message="⚡ Detaching from gateway-hosted session...",
+            ):
+                return
             self._should_exit = True
             event.app.exit()
 
@@ -9022,6 +9091,13 @@ def main(
     
     parsed_skills = _parse_skills_argument(skills)
 
+    gateway_session_mode = (
+        not query
+        and sys.stdin.isatty()
+        and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
     # Create CLI instance
     cli = HermesCLI(
         model=model,
@@ -9035,6 +9111,7 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
+        gateway_session_mode=gateway_session_mode,
     )
 
     if parsed_skills:

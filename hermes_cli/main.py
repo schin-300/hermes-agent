@@ -585,8 +585,16 @@ def cmd_chat(args):
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
 
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
+    gateway_session_mode = (
+        not getattr(args, "query", None)
+        and sys.stdin.isatty()
+        and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
+    # First-run guard: interactive gateway-backed CLI sessions use the gateway's
+    # runtime, so they do not require a locally configured provider.
+    if not gateway_session_mode and not _has_any_provider_configured():
         print()
         print("It looks like Hermes isn't configured yet -- no API keys or providers found.")
         print()
@@ -611,6 +619,14 @@ def cmd_chat(args):
         print()
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
+
+    if gateway_session_mode:
+        try:
+            from hermes_cli.gateway_session_client import ensure_gateway_session_bridge
+            ensure_gateway_session_bridge()
+        except Exception as exc:
+            print(f"Error starting gateway session bridge: {exc}")
+            sys.exit(1)
 
     # Start update check in background (runs while other init happens)
     try:
@@ -4454,6 +4470,11 @@ For more help on a command:
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
     gateway_stop.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     gateway_stop.add_argument("--all", action="store_true", help="Stop ALL gateway processes across all profiles")
+
+    # gateway close (same as stop; explicit user-facing wording for hosted sessions)
+    gateway_close = gateway_subparsers.add_parser("close", help="Close the hosted gateway for this profile")
+    gateway_close.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_close.add_argument("--all", action="store_true", help="Close ALL gateway processes across all profiles")
     
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")
