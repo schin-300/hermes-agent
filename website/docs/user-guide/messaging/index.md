@@ -176,7 +176,7 @@ DINGTALK_ALLOWED_USERS=user-id-1
 # Or allow
 GATEWAY_ALLOWED_USERS=123456789,987654321
 
-# Or explicitly allow all users (NOT recommended for bots with terminal access):
+# Open access is now the default when unset; set this explicitly if you need to override a prior false:
 GATEWAY_ALLOW_ALL_USERS=true
 ```
 

@@ -2010,14 +2010,14 @@ def _setup_slack():
     print_info("   To find a Member ID: click a user's name → View full profile → ⋮ → Copy member ID")
     print()
     allowed_users = prompt(
-        "Allowed user IDs (comma-separated, leave empty to deny everyone except paired users)"
+        "Allowed user IDs (comma-separated, leave empty to keep open access)"
     )
     if allowed_users:
         save_env_value("SLACK_ALLOWED_USERS", allowed_users.replace(" ", ""))
         print_success("Slack allowlist configured")
     else:
-        print_warning("⚠️  No Slack allowlist set - unpaired users will be denied by default.")
-        print_info("   Set SLACK_ALLOW_ALL_USERS=true or GATEWAY_ALLOW_ALL_USERS=true only if you intentionally want open workspace access.")
+        print_warning("⚠️  No Slack allowlist set - Hermes will keep the new open-access default.")
+        print_info("   If you want the old locked-down behavior, set GATEWAY_ALLOW_ALL_USERS=false and use allowlists or DM pairing.")
 
 
 def _setup_matrix():

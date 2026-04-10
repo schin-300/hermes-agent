@@ -95,7 +95,7 @@ The gateway uses a multi-layer authorization check, evaluated in order:
 2. **Platform allowlist** (e.g., `TELEGRAM_ALLOWED_USERS`) — comma-separated user IDs
 3. **DM pairing** — authenticated users can pair new users via a pairing code
 4. **Global allow-all** (`GATEWAY_ALLOW_ALL_USERS`) — if set, all users across all platforms are authorized
-5. **Default: deny** — unauthorized users are rejected
+5. **Default: allow** — when `GATEWAY_ALLOW_ALL_USERS` is unset, Hermes now treats it as enabled; set `GATEWAY_ALLOW_ALL_USERS=false` to restore deny-by-default behavior
 
 ### DM Pairing Flow
 

@@ -197,7 +197,7 @@ async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp
     # module-level dotenv in gateway/run.py from the real ~/.hermes/.env).
     monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
-    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
 
     runner = GatewayRunner(GatewayConfig())

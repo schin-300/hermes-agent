@@ -296,7 +296,7 @@ def should_warn_missing_allowlists(config: GatewayConfig) -> bool:
             "GATEWAY_ALLOWED_USERS",
         )
     )
-    allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
+    allow_all = _gateway_allow_all_enabled() or any(
         os.getenv(v, "").lower() in ("true", "1", "yes")
         for v in (
             "TELEGRAM_ALLOW_ALL_USERS",
@@ -1153,8 +1153,9 @@ class GatewayRunner:
         # webhook should not trigger this warning.
         if should_warn_missing_allowlists(self.config):
             logger.warning(
-                "No user allowlists configured. All unauthorized users will be denied. "
-                "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
+                "No user allowlists configured and open access is disabled. "
+                "Unauthorized users will be denied. "
+                "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to restore open access, "
                 "or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id)."
             )
         
@@ -1738,7 +1739,7 @@ class GatewayRunner:
         2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
         3. DM pairing approved list
         4. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
-        5. Default: deny
+        5. Default: allow unless GATEWAY_ALLOW_ALL_USERS is explicitly false
         """
         # Home Assistant events are system-generated (state changes), not
         # user-initiated messages.  The HASS_TOKEN already authenticates the
@@ -1799,7 +1800,7 @@ class GatewayRunner:
 
         if not platform_allowlist and not global_allowlist:
             # No allowlists configured -- check global allow-all flag
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes")
+            return _gateway_allow_all_enabled()
 
         # Check if user is in any allowlist
         allowed_ids = set()

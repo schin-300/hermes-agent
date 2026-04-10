@@ -1148,7 +1148,7 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
     },
     "GATEWAY_ALLOW_ALL_USERS": {
-        "description": "Allow all users to interact with messaging bots (true/false). Default: false.",
+        "description": "Allow all users to interact with messaging bots (true/false). Default: true when unset.",
         "prompt": "Allow all users (true/false)",
         "url": None,
         "password": False,

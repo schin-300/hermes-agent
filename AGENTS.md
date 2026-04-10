@@ -8,6 +8,10 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source venv/bin/activate  # ALWAYS activate before running Python
 ```
 
+## Agent Notes
+
+- 2026-04-10 00:10:03 EDT — Hermes changed the gateway default so `GATEWAY_ALLOW_ALL_USERS` behaves like `true` when unset. If you need the old locked-down behavior for tests or setup flows, explicitly set `GATEWAY_ALLOW_ALL_USERS=false`.
+
 ## Project Structure
 
 ```

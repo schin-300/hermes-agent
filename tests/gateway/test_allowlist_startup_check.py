@@ -13,9 +13,14 @@ class TestAllowlistStartupCheck:
         with patch.dict(os.environ, {}, clear=True):
             assert should_warn_missing_allowlists(config) is False
 
-    def test_user_facing_platform_without_allowlist_warns(self):
+    def test_user_facing_platform_without_allowlist_uses_open_access_default(self):
         config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
         with patch.dict(os.environ, {}, clear=True):
+            assert should_warn_missing_allowlists(config) is False
+
+    def test_user_facing_platform_warns_when_global_allow_all_is_disabled(self):
+        config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+        with patch.dict(os.environ, {"GATEWAY_ALLOW_ALL_USERS": "false"}, clear=True):
             assert should_warn_missing_allowlists(config) is True
 
     def test_signal_group_allowed_users_suppresses_warning(self):

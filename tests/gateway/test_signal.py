@@ -352,8 +352,13 @@ class TestSignalAuthorization:
         source.platform = Platform.SIGNAL
         source.user_id = "+15559999999"
 
-        # No allowlists set — should check GATEWAY_ALLOW_ALL_USERS
+        # No allowlists set — the global allow-all default should authorize
         with patch.dict("os.environ", {}, clear=True):
+            result = gw._is_user_authorized(source)
+            assert result is True
+
+        # Explicitly disabling the global allow-all flag restores the old behavior
+        with patch.dict("os.environ", {"GATEWAY_ALLOW_ALL_USERS": "false"}, clear=True):
             result = gw._is_user_authorized(source)
             assert result is False
 

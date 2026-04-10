@@ -218,7 +218,7 @@ When running in a container backend (Docker, Singularity, Modal, Daytona), dange
 
 ### Use Allowlists for Messaging Bots
 
-Never set `GATEWAY_ALLOW_ALL_USERS=true` on a bot with terminal access. Always use platform-specific allowlists (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`) or DM pairing to control who can interact with your agent.
+Hermes now defaults `GATEWAY_ALLOW_ALL_USERS` to open access when unset, so for any bot with terminal access you should explicitly set `GATEWAY_ALLOW_ALL_USERS=false` and then use platform-specific allowlists (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`) or DM pairing to control who can interact with your agent.
 
 ```bash
 # Recommended: explicit allowlists per platform

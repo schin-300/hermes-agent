@@ -37,6 +37,10 @@ def _clear_auth_env(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+def _force_pairing_mode(monkeypatch) -> None:
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "false")
+
+
 def _make_event(platform: Platform, user_id: str, chat_id: str) -> MessageEvent:
     return MessageEvent(
         text="hello",
@@ -130,9 +134,28 @@ def test_star_wildcard_works_for_any_platform(monkeypatch):
     assert runner._is_user_authorized(source) is True
 
 
-@pytest.mark.asyncio
-async def test_unauthorized_dm_pairs_by_default(monkeypatch):
+def test_global_allow_all_defaults_to_true_when_unset(monkeypatch):
     _clear_auth_env(monkeypatch)
+
+    runner, _adapter = _make_runner(
+        Platform.TELEGRAM,
+        GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")}),
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="123456789",
+        chat_id="123456789",
+        user_name="stranger",
+        chat_type="dm",
+    )
+    assert runner._is_user_authorized(source) is True
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_dm_pairs_when_global_allow_all_is_disabled(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    _force_pairing_mode(monkeypatch)
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -160,6 +183,7 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
 @pytest.mark.asyncio
 async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
     _clear_auth_env(monkeypatch)
+    _force_pairing_mode(monkeypatch)
     config = GatewayConfig(
         platforms={
             Platform.WHATSAPP: PlatformConfig(
@@ -187,6 +211,7 @@ async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
 async def test_rate_limited_user_gets_no_response(monkeypatch):
     """When a user is already rate-limited, pairing messages are silently ignored."""
     _clear_auth_env(monkeypatch)
+    _force_pairing_mode(monkeypatch)
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -211,6 +236,7 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
     """After sending a 'too many requests' rejection, rate limit is recorded
     so subsequent messages are silently ignored."""
     _clear_auth_env(monkeypatch)
+    _force_pairing_mode(monkeypatch)
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -236,6 +262,7 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
 @pytest.mark.asyncio
 async def test_global_ignore_suppresses_pairing_reply(monkeypatch):
     _clear_auth_env(monkeypatch)
+    _force_pairing_mode(monkeypatch)
     config = GatewayConfig(
         unauthorized_dm_behavior="ignore",
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},

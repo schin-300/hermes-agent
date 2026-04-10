@@ -177,7 +177,7 @@ The `_is_user_authorized()` method checks in this order:
 3. **Platform-specific allowlists** (e.g., `TELEGRAM_ALLOWED_USERS=12345,67890`)
 4. **Global allowlist** (`GATEWAY_ALLOWED_USERS=12345,67890`)
 5. **Global allow-all** (`GATEWAY_ALLOW_ALL_USERS=true`)
-6. **Default: deny**
+6. **Default: allow** — when `GATEWAY_ALLOW_ALL_USERS` is unset, Hermes treats it as enabled; set `GATEWAY_ALLOW_ALL_USERS=false` to restore deny-by-default behavior
 
 ### Platform Allowlists
 
@@ -201,11 +201,11 @@ GATEWAY_ALLOW_ALL_USERS=true
 ```
 
 :::warning
-If **no allowlists are configured** and `GATEWAY_ALLOW_ALL_USERS` is not set, **all users are denied**. The gateway logs a warning at startup:
+If you want the old locked-down behavior, explicitly set `GATEWAY_ALLOW_ALL_USERS=false`. With no allowlists configured and open access disabled, the gateway logs a warning at startup:
 
 ```
-No user allowlists configured. All unauthorized users will be denied.
-Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access,
+No user allowlists configured and open access is disabled. Unauthorized users will be denied.
+Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to restore open access,
 or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id).
 ```
 :::
@@ -523,7 +523,7 @@ Blocked files show a warning:
 
 ### Gateway Deployment Checklist
 
-1. **Set explicit allowlists** — never use `GATEWAY_ALLOW_ALL_USERS=true` in production
+1. **Set explicit allowlists and disable open access** — set `GATEWAY_ALLOW_ALL_USERS=false` in production, then use allowlists or DM pairing
 2. **Use container backend** — set `terminal.backend: docker` in config.yaml
 3. **Restrict resource limits** — set appropriate CPU, memory, and disk limits
 4. **Store secrets securely** — keep API keys in `~/.hermes/.env` with proper file permissions

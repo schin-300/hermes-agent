@@ -1726,11 +1726,11 @@ def _setup_standard_platform(platform: dict):
         if existing and var["name"] != token_var:
             print_info(f"  Current: {existing}")
 
-        # Allowlist fields get special handling for the deny-by-default security model
+        # Allowlist fields get special handling for gateway access mode selection
         if var.get("is_allowlist"):
-            print_info("  The gateway DENIES all users by default for security.")
+            print_info("  Hermes gateway now ALLOWS all users by default.")
             print_info("  Enter user IDs to create an allowlist, or leave empty")
-            print_info("  and you'll be asked about open access next.")
+            print_info("  to keep open access or switch to pairing/deny mode next.")
             value = prompt(f"  {var['prompt']}", password=False)
             if value:
                 cleaned = value.replace(" ", "")
@@ -1750,22 +1750,24 @@ def _setup_standard_platform(platform: dict):
                 print_success("  Saved — only these users can interact with the bot.")
                 allowed_val_set = cleaned
             else:
-                # No allowlist — ask about open access vs DM pairing
+                # No allowlist — choose whether to keep open access or opt into tighter controls
                 print()
                 access_choices = [
-                    "Enable open access (anyone can message the bot)",
-                    "Use DM pairing (unknown users request access, you approve with 'hermes pairing approve')",
-                    "Skip for now (bot will deny all users until configured)",
+                    "Keep the new open-access default (anyone can message the bot)",
+                    "Use DM pairing (set GATEWAY_ALLOW_ALL_USERS=false; unknown users request access)",
+                    "Lock it down for now (set GATEWAY_ALLOW_ALL_USERS=false and deny everyone until configured)",
                 ]
-                access_idx = prompt_choice("  How should unauthorized users be handled?", access_choices, 1)
+                access_idx = prompt_choice("  How should unauthorized users be handled?", access_choices, 0)
                 if access_idx == 0:
                     save_env_value("GATEWAY_ALLOW_ALL_USERS", "true")
-                    print_warning("  Open access enabled — anyone can use your bot!")
+                    print_warning("  Open access kept — anyone can use your bot!")
                 elif access_idx == 1:
+                    save_env_value("GATEWAY_ALLOW_ALL_USERS", "false")
                     print_success("  DM pairing mode — users will receive a code to request access.")
                     print_info("  Approve with: hermes pairing approve {platform} {code}")
                 else:
-                    print_info("  Skipped — configure later with 'hermes gateway setup'")
+                    save_env_value("GATEWAY_ALLOW_ALL_USERS", "false")
+                    print_info("  Locked down — all users will be denied until configured later.")
             continue
 
         value = prompt(f"  {var['prompt']}", password=var.get("password", False))
@@ -1931,7 +1933,7 @@ def _setup_signal():
 
     # Allowed users
     print()
-    print_info("  The gateway DENIES all users by default for security.")
+    print_info("  Hermes gateway now ALLOWS all users by default unless you set an allowlist.")
     print_info("  Enter phone numbers or UUIDs of allowed users (comma-separated).")
     existing_allowed = get_env_value("SIGNAL_ALLOWED_USERS") or ""
     default_allowed = existing_allowed or account
