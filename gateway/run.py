@@ -969,6 +969,45 @@ class GatewayRunner:
         self._exit_cleanly = True
         self._exit_reason = reason
         self._shutdown_event.set()
+
+    def _viewer_runtime_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Build a lightweight runtime snapshot for the browser visibility layer."""
+        gateway_sessions: Dict[str, Dict[str, Any]] = {}
+
+        for session_key, agent in list(self._running_agents.items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                gateway_sessions[session_key] = {
+                    "status": "starting",
+                    "activity": "starting up",
+                    "current_tool": None,
+                    "seconds_since_activity": 0.0,
+                    "model": None,
+                }
+                continue
+
+            activity = {
+                "status": "running",
+                "activity": "processing",
+                "current_tool": None,
+                "seconds_since_activity": None,
+                "model": getattr(agent, "model", None),
+            }
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    summary = agent.get_activity_summary() or {}
+                except Exception:
+                    summary = {}
+                activity.update({
+                    "activity": summary.get("last_activity_desc") or activity["activity"],
+                    "current_tool": summary.get("current_tool"),
+                    "seconds_since_activity": summary.get("seconds_since_activity"),
+                })
+            gateway_sessions[session_key] = activity
+
+        return {
+            "gateway_sessions": gateway_sessions,
+            "api_sessions": {},
+        }
     
     @staticmethod
     def _load_prefill_messages() -> List[Dict[str, Any]]:
@@ -1216,6 +1255,11 @@ class GatewayRunner:
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            if hasattr(adapter, "set_viewer_runtime_provider"):
+                try:
+                    adapter.set_viewer_runtime_provider(self._viewer_runtime_snapshot)
+                except Exception:
+                    logger.debug("Failed to wire viewer runtime provider into %s", platform.value, exc_info=True)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)

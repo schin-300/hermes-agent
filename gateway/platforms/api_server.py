@@ -27,6 +27,7 @@ import os
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -49,6 +50,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+VIEWER_POLL_INTERVAL_SECONDS = 1.0
+VIEWER_RECENT_WINDOW_MINUTES = 24 * 60
+VIEWER_MAX_SESSIONS = 200
+VIEWER_INDEX_PATH = Path(__file__).with_name("viewer_index.html")
+API_SERVER_APP_KEY = web.AppKey("api_server_adapter", object) if AIOHTTP_AVAILABLE else None
 
 
 def check_api_server_requirements() -> bool:
@@ -177,7 +183,9 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
         """Add CORS headers for explicitly allowed origins; handle OPTIONS preflight."""
-        adapter = request.app.get("api_server_adapter")
+        adapter = (
+            request.app.get(API_SERVER_APP_KEY) if API_SERVER_APP_KEY is not None else None
+        ) or request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
         cors_headers = None
         if adapter is not None:
@@ -311,7 +319,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_tasks: Dict[str, "asyncio.Task[Any]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
+        # run_id -> hosted session_id so the visibility layer can group active runs
+        self._run_session_ids: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._viewer_runtime_provider = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -401,6 +412,243 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    def set_viewer_runtime_provider(self, provider) -> None:
+        """Register a lightweight runtime provider for the visibility layer."""
+        self._viewer_runtime_provider = provider
+
+    def _viewer_auth_ok(self, request: "web.Request") -> bool:
+        """Allow local browser access to the viewer without a bearer key."""
+        auth_err = self._check_auth(request)
+        if auth_err is None:
+            return True
+
+        host = (request.host or "").split(":", 1)[0].strip().lower()
+        remote = str(getattr(request, "remote", "") or "").strip().lower()
+        local_tokens = {"127.0.0.1", "::1", "localhost", ""}
+        return host in local_tokens and remote in local_tokens
+
+    def _load_viewer_html(self) -> str:
+        """Load the visibility-layer UI shell."""
+        try:
+            return VIEWER_INDEX_PATH.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.exception("[api_server] failed to load viewer html from %s", VIEWER_INDEX_PATH)
+            return (
+                "<!doctype html><html><body><h1>Hermes Visibility Layer</h1>"
+                f"<p>Viewer asset load failed: {exc}</p></body></html>"
+            )
+
+    @staticmethod
+    def _format_viewer_timestamp(value: Any) -> Optional[float]:
+        try:
+            if value in (None, ""):
+                return None
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _viewer_room_for(status: str, current_tool: Optional[str]) -> str:
+        if status in {"error", "failed"}:
+            return "error"
+        if current_tool:
+            return "tools"
+        if status in {"running", "starting"}:
+            return "thinking"
+        if status == "idle":
+            return "idle"
+        return "archive"
+
+    def _viewer_runtime_snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        provider = self._viewer_runtime_provider
+        if provider is None:
+            return {"gateway_sessions": {}, "api_sessions": {}}
+        try:
+            data = provider() or {}
+        except Exception:
+            logger.debug("[api_server] viewer runtime provider failed", exc_info=True)
+            return {"gateway_sessions": {}, "api_sessions": {}}
+        gateway_sessions = data.get("gateway_sessions") if isinstance(data, dict) else {}
+        api_sessions = data.get("api_sessions") if isinstance(data, dict) else {}
+        return {
+            "gateway_sessions": gateway_sessions if isinstance(gateway_sessions, dict) else {},
+            "api_sessions": api_sessions if isinstance(api_sessions, dict) else {},
+        }
+
+    def _current_api_run_activity(self) -> Dict[str, Dict[str, Any]]:
+        runtime: Dict[str, Dict[str, Any]] = {}
+        for run_id, session_id in list(self._run_session_ids.items()):
+            activity: Dict[str, Any] = {
+                "status": "running",
+                "activity": "processing run",
+                "run_id": run_id,
+            }
+            agent_ref = self._run_agents.get(run_id)
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None and hasattr(agent, "get_activity_summary"):
+                try:
+                    summary = agent.get_activity_summary() or {}
+                except Exception:
+                    summary = {}
+                activity.update({
+                    "activity": summary.get("last_activity_desc") or activity["activity"],
+                    "current_tool": summary.get("current_tool"),
+                    "seconds_since_activity": summary.get("seconds_since_activity"),
+                    "model": getattr(agent, "model", None),
+                })
+            runtime[session_id] = activity
+        return runtime
+
+    def _collect_gateway_viewer_agents(self, runtime_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None or not hasattr(session_store, "list_sessions"):
+            return []
+
+        try:
+            entries = session_store.list_sessions(active_minutes=VIEWER_RECENT_WINDOW_MINUTES)
+        except Exception:
+            logger.debug("[api_server] failed to list gateway sessions for viewer", exc_info=True)
+            return []
+
+        gateway_runtime = runtime_snapshot.get("gateway_sessions", {})
+        agents: List[Dict[str, Any]] = []
+        for entry in entries[:VIEWER_MAX_SESSIONS]:
+            runtime = gateway_runtime.get(getattr(entry, "session_key", ""), {})
+            status = str(runtime.get("status") or "idle")
+            current_tool = runtime.get("current_tool")
+            display_name = getattr(entry, "display_name", None) or getattr(entry, "session_id", "session")
+            platform = getattr(getattr(entry, "platform", None), "value", None) or getattr(getattr(entry, "origin", None), "platform", None)
+            if hasattr(platform, "value"):
+                platform = platform.value
+            updated_at = getattr(entry, "updated_at", None)
+            agents.append({
+                "id": f"gateway:{entry.session_key}",
+                "kind": "gateway",
+                "session_key": entry.session_key,
+                "session_id": entry.session_id,
+                "display_name": display_name,
+                "title": None,
+                "source": platform or "gateway",
+                "status": status,
+                "room": self._viewer_room_for(status, current_tool),
+                "activity": runtime.get("activity") or "waiting for input",
+                "current_tool": current_tool,
+                "seconds_since_activity": runtime.get("seconds_since_activity"),
+                "model": runtime.get("model"),
+                "preview": None,
+                "started_at": None,
+                "updated_at": self._format_viewer_timestamp(updated_at.timestamp() if updated_at is not None else None),
+                "message_count": None,
+                "tokens": int(getattr(entry, "total_tokens", 0) or 0),
+            })
+        return agents
+
+    def _collect_api_viewer_agents(self, runtime_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        db = self._ensure_session_db()
+        if db is None:
+            return []
+
+        try:
+            rows = db.list_sessions_rich(source="api_server", limit=VIEWER_MAX_SESSIONS)
+        except Exception:
+            logger.debug("[api_server] failed to list api_server sessions for viewer", exc_info=True)
+            rows = []
+
+        cutoff = time.time() - (VIEWER_RECENT_WINDOW_MINUTES * 60)
+        active_runtime = self._current_api_run_activity()
+        active_runtime.update(runtime_snapshot.get("api_sessions", {}))
+
+        agents: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for row in rows:
+            session_id = str(row.get("id") or "")
+            if not session_id:
+                continue
+            last_active = self._format_viewer_timestamp(row.get("last_active"))
+            ended_at = self._format_viewer_timestamp(row.get("ended_at"))
+            if ended_at is not None and (last_active is None or last_active < cutoff) and session_id not in active_runtime:
+                continue
+
+            runtime = active_runtime.get(session_id, {})
+            status = str(runtime.get("status") or ("running" if session_id in active_runtime else "idle"))
+            current_tool = runtime.get("current_tool")
+            preview = str(row.get("preview") or "").strip() or None
+            title = str(row.get("title") or "").strip() or None
+            display_name = title or preview or session_id[:12]
+            tokens = int(row.get("input_tokens") or 0) + int(row.get("output_tokens") or 0)
+            agents.append({
+                "id": f"api:{session_id}",
+                "kind": "api_server",
+                "session_key": None,
+                "session_id": session_id,
+                "display_name": display_name,
+                "title": title,
+                "source": str(row.get("source") or "api_server"),
+                "status": status,
+                "room": self._viewer_room_for(status, current_tool),
+                "activity": runtime.get("activity") or ("waiting for input" if ended_at is None else "closed"),
+                "current_tool": current_tool,
+                "seconds_since_activity": runtime.get("seconds_since_activity"),
+                "model": runtime.get("model") or row.get("model"),
+                "preview": preview,
+                "started_at": self._format_viewer_timestamp(row.get("started_at")),
+                "updated_at": last_active,
+                "message_count": int(row.get("message_count") or 0),
+                "tokens": tokens,
+            })
+            seen_ids.add(session_id)
+
+        for session_id, runtime in active_runtime.items():
+            if session_id in seen_ids:
+                continue
+            status = str(runtime.get("status") or "running")
+            current_tool = runtime.get("current_tool")
+            agents.append({
+                "id": f"api:{session_id}",
+                "kind": "api_server",
+                "session_key": None,
+                "session_id": session_id,
+                "display_name": session_id[:12],
+                "title": None,
+                "source": "api_server",
+                "status": status,
+                "room": self._viewer_room_for(status, current_tool),
+                "activity": runtime.get("activity") or "processing run",
+                "current_tool": current_tool,
+                "seconds_since_activity": runtime.get("seconds_since_activity"),
+                "model": runtime.get("model"),
+                "preview": None,
+                "started_at": None,
+                "updated_at": None,
+                "message_count": None,
+                "tokens": 0,
+            })
+
+        return agents
+
+    def _build_viewer_snapshot(self) -> Dict[str, Any]:
+        runtime_snapshot = self._viewer_runtime_snapshot()
+        agents = self._collect_gateway_viewer_agents(runtime_snapshot)
+        agents.extend(self._collect_api_viewer_agents(runtime_snapshot))
+        agents.sort(
+            key=lambda agent: (
+                0 if agent.get("status") in {"running", "starting"} else 1,
+                -(agent.get("updated_at") or 0),
+                str(agent.get("display_name") or ""),
+            )
+        )
+        counts = {
+            "total": len(agents),
+            "running": sum(1 for agent in agents if agent.get("status") == "running"),
+            "idle": sum(1 for agent in agents if agent.get("status") == "idle"),
+            "error": sum(1 for agent in agents if agent.get("status") in {"error", "failed"}),
+        }
+        return {
+            "generated_at": round(time.time(), 3),
+            "counts": counts,
+            "agents": agents,
+        }
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -472,6 +720,48 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+    async def _handle_viewer(self, request: "web.Request") -> "web.Response":
+        """GET /viewer — interactive browser visibility layer for gateway-hosted agents."""
+        if not self._viewer_auth_ok(request):
+            return web.Response(status=401, text="Viewer unavailable: invalid API key")
+        return web.Response(text=self._load_viewer_html(), content_type="text/html")
+
+    async def _handle_viewer_agents(self, request: "web.Request") -> "web.Response":
+        """GET /api/viewer/agents — current visibility snapshot."""
+        if not self._viewer_auth_ok(request):
+            return web.json_response(_openai_error("Invalid API key", code="invalid_api_key"), status=401)
+        return web.json_response(self._build_viewer_snapshot())
+
+    async def _handle_viewer_events(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /api/viewer/events — live SSE stream of visibility snapshots."""
+        if not self._viewer_auth_ok(request):
+            return web.json_response(_openai_error("Invalid API key", code="invalid_api_key"), status=401)
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+
+        previous_payload = None
+        try:
+            while True:
+                snapshot = self._build_viewer_snapshot()
+                payload = json.dumps(snapshot, sort_keys=True)
+                if payload != previous_payload:
+                    await response.write(f"data: {payload}\n\n".encode())
+                    previous_payload = payload
+                else:
+                    await response.write(b": keepalive\n\n")
+                await asyncio.sleep(VIEWER_POLL_INTERVAL_SECONDS)
+        except Exception as exc:
+            logger.debug("[api_server] viewer SSE stream closed: %s", exc)
+        return response
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -1510,6 +1800,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
         agent_ref: list[Any] = [None]
         self._run_agents[run_id] = agent_ref
+        self._run_session_ids[run_id] = session_id
 
         async def _run_and_close():
             try:
@@ -1561,6 +1852,7 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 self._run_agents.pop(run_id, None)
                 self._run_tasks.pop(run_id, None)
+                self._run_session_ids.pop(run_id, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1712,9 +2004,16 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
-            self._app["api_server_adapter"] = self
+            if API_SERVER_APP_KEY is not None:
+                self._app[API_SERVER_APP_KEY] = self
+            else:
+                self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/viewer", self._handle_viewer)
+            self._app.router.add_get("/viewer/", self._handle_viewer)
+            self._app.router.add_get("/api/viewer/agents", self._handle_viewer_agents)
+            self._app.router.add_get("/api/viewer/events", self._handle_viewer_events)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
@@ -1762,6 +2061,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d",
+                self.name, self._host, self._port,
+            )
+            logger.info(
+                "[%s] Visibility viewer available at http://%s:%d/viewer",
                 self.name, self._host, self._port,
             )
             return True

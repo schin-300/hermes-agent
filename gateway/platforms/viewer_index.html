@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Visibility Layer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071018;
+      --panel: rgba(12, 21, 33, 0.92);
+      --panel-strong: rgba(16, 28, 45, 0.98);
+      --border: rgba(120, 194, 255, 0.18);
+      --text: #e9f5ff;
+      --muted: #8ba5be;
+      --accent: #66d9ff;
+      --accent-2: #b4ff7b;
+      --warning: #ffbe64;
+      --danger: #ff6b91;
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: radial-gradient(circle at top, #0f1c2b 0%, var(--bg) 60%); color: var(--text); }
+    body { overflow: hidden; }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      grid-template-areas:
+        "header header"
+        "legend sidebar"
+        "map sidebar"
+        "footer sidebar";
+      height: 100vh;
+      gap: 14px;
+      padding: 16px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .header {
+      grid-area: header;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 22px;
+    }
+
+    .title-stack h1 {
+      margin: 0;
+      font-size: 1.4rem;
+      letter-spacing: 0.02em;
+    }
+
+    .title-stack p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(102, 217, 255, 0.08);
+      border: 1px solid rgba(102, 217, 255, 0.18);
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--warning);
+      box-shadow: 0 0 14px currentColor;
+    }
+
+    .status-pill.live .status-dot { color: #75ff8b; background: #75ff8b; }
+    .status-pill.reconnecting .status-dot { color: var(--warning); background: var(--warning); }
+    .status-pill.error .status-dot { color: var(--danger); background: var(--danger); }
+
+    .legend {
+      grid-area: legend;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 14px 16px;
+      align-items: center;
+    }
+
+    .chip {
+      min-width: 120px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .chip-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .chip-value { margin-top: 5px; font-size: 1.15rem; font-weight: 650; }
+
+    .map-wrap {
+      grid-area: map;
+      position: relative;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(15, 24, 38, 0.95), rgba(7, 12, 20, 0.98));
+    }
+
+    .map-overlay {
+      position: absolute;
+      inset: 18px 18px auto auto;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(4, 10, 18, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .sidebar {
+      grid-area: sidebar;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--panel-strong);
+    }
+
+    .sidebar-section {
+      padding: 18px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .sidebar h2, .sidebar h3 {
+      margin: 0 0 10px;
+      font-size: 1rem;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .meta-item {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .meta-item .label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .meta-item .value {
+      font-size: 0.92rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .agent-list {
+      list-style: none;
+      margin: 0;
+      padding: 8px;
+      overflow: auto;
+      flex: 1;
+    }
+
+    .agent-card {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      margin-bottom: 8px;
+      border-radius: 14px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      background: rgba(255,255,255,0.03);
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+    }
+
+    .agent-card:hover, .agent-card.selected {
+      transform: translateY(-1px);
+      border-color: rgba(102, 217, 255, 0.3);
+      background: rgba(102, 217, 255, 0.08);
+    }
+
+    .sprite-dot {
+      width: 18px;
+      height: 18px;
+      border-radius: 6px;
+      box-shadow: 0 0 16px rgba(255,255,255,0.14);
+    }
+
+    .agent-name { font-weight: 650; }
+    .agent-sub { color: var(--muted); font-size: 0.86rem; margin-top: 3px; }
+    .agent-room { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; }
+
+    .footer {
+      grid-area: footer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 18px;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 18px;
+      line-height: 1.5;
+    }
+
+    .activity-text {
+      font-size: 0.96rem;
+      line-height: 1.5;
+      color: var(--text);
+      padding: 14px 16px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    code.inline {
+      padding: 2px 6px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.06);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85em;
+    }
+
+    @media (max-width: 1100px) {
+      body { overflow: auto; }
+      .app {
+        height: auto;
+        min-height: 100vh;
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto minmax(460px, 60vh) auto auto;
+        grid-template-areas:
+          "header"
+          "legend"
+          "map"
+          "sidebar"
+          "footer";
+      }
+      .sidebar { min-height: 520px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <section class="panel header">
+      <div class="title-stack">
+        <h1>Hermes Visibility Layer</h1>
+        <p>Browser-native observer for gateway-hosted agents. The map is just a window into runtime state — it does not own the agent core.</p>
+      </div>
+      <div id="connection-status" class="status-pill reconnecting">
+        <span class="status-dot"></span>
+        <span id="connection-label">Connecting…</span>
+      </div>
+    </section>
+
+    <section class="panel legend" id="counts"></section>
+
+    <section class="panel map-wrap">
+      <canvas id="world"></canvas>
+      <div class="map-overlay">Live map — click a sprite for close-up state</div>
+    </section>
+
+    <aside class="panel sidebar">
+      <div class="sidebar-section">
+        <h2>Selected agent</h2>
+        <div id="selected-summary" class="empty">Waiting for live snapshot…</div>
+      </div>
+      <div class="sidebar-section">
+        <h3>Activity</h3>
+        <div id="selected-activity" class="activity-text">No activity yet.</div>
+      </div>
+      <div class="sidebar-section" style="padding-bottom: 10px;">
+        <h3>Agents</h3>
+      </div>
+      <ul id="agent-list" class="agent-list"></ul>
+    </aside>
+
+    <footer class="panel footer">
+      <div>Source endpoints: <code class="inline">/api/viewer/agents</code> + <code class="inline">/api/viewer/events</code></div>
+      <div id="last-sync">Waiting for sync…</div>
+    </footer>
+  </div>
+
+  <script>
+    const SNAPSHOT_ENDPOINT = '/api/viewer/agents';
+    const EVENTS_ENDPOINT = '/api/viewer/events';
+
+    const rooms = [
+      { id: 'idle', label: 'Idle Grove', x: 0.04, y: 0.11, w: 0.28, h: 0.34, tint: '#173c59' },
+      { id: 'thinking', label: 'Thinking Atrium', x: 0.36, y: 0.08, w: 0.27, h: 0.36, tint: '#3b2258' },
+      { id: 'tools', label: 'Tool Forge', x: 0.67, y: 0.11, w: 0.28, h: 0.34, tint: '#4f3c16' },
+      { id: 'archive', label: 'Archive Dock', x: 0.08, y: 0.56, w: 0.38, h: 0.28, tint: '#183327' },
+      { id: 'error', label: 'Red Zone', x: 0.56, y: 0.56, w: 0.30, h: 0.28, tint: '#4d1e2d' },
+    ];
+
+    const canvas = document.getElementById('world');
+    const ctx = canvas.getContext('2d');
+    const countsEl = document.getElementById('counts');
+    const agentListEl = document.getElementById('agent-list');
+    const selectedSummaryEl = document.getElementById('selected-summary');
+    const selectedActivityEl = document.getElementById('selected-activity');
+    const connectionStatusEl = document.getElementById('connection-status');
+    const connectionLabelEl = document.getElementById('connection-label');
+    const lastSyncEl = document.getElementById('last-sync');
+
+    const state = {
+      snapshot: null,
+      agents: [],
+      selectedId: null,
+      positions: new Map(),
+      hitboxes: [],
+      lastUpdateAt: 0,
+      stream: null,
+      fallbackTimer: null,
+      lastPayload: null,
+    };
+
+    function setConnectionState(mode, label) {
+      connectionStatusEl.className = `status-pill ${mode}`;
+      connectionLabelEl.textContent = label;
+    }
+
+    function seededNumber(key, salt = 0) {
+      let hash = 2166136261 ^ salt;
+      for (let i = 0; i < key.length; i += 1) {
+        hash ^= key.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return (hash >>> 0) / 4294967295;
+    }
+
+    function colorForAgent(agent) {
+      const hue = Math.floor(seededNumber(agent.id, 17) * 360);
+      return `hsl(${hue}deg 86% 67%)`;
+    }
+
+    function roomById(id) {
+      return rooms.find((room) => room.id === id) || rooms[0];
+    }
+
+    function formatAgo(seconds) {
+      if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return 'n/a';
+      const total = Math.max(0, Number(seconds));
+      if (total < 2) return 'just now';
+      if (total < 60) return `${Math.round(total)}s ago`;
+      if (total < 3600) return `${Math.round(total / 60)}m ago`;
+      return `${Math.round(total / 3600)}h ago`;
+    }
+
+    function formatTimestamp(ts) {
+      if (!ts) return 'n/a';
+      return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function renderCounts(snapshot) {
+      const counts = snapshot?.counts || { total: 0, running: 0, idle: 0, error: 0 };
+      const items = [
+        ['Visible agents', counts.total],
+        ['Running', counts.running],
+        ['Idle', counts.idle],
+        ['Errors', counts.error],
+      ];
+      countsEl.innerHTML = items.map(([label, value]) => `
+        <div class="chip">
+          <div class="chip-label">${label}</div>
+          <div class="chip-value">${value}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderAgentList() {
+      if (!state.agents.length) {
+        agentListEl.innerHTML = '<li class="empty">No live or recently active gateway agents found.</li>';
+        return;
+      }
+
+      agentListEl.innerHTML = '';
+      state.agents.forEach((agent) => {
+        const li = document.createElement('li');
+        li.className = `agent-card${agent.id === state.selectedId ? ' selected' : ''}`;
+        li.dataset.agentId = agent.id;
+        li.innerHTML = `
+          <span class="sprite-dot" style="background:${colorForAgent(agent)}"></span>
+          <div>
+            <div class="agent-name">${agent.display_name || agent.session_id}</div>
+            <div class="agent-sub">${agent.activity || 'waiting'} · ${formatAgo(agent.seconds_since_activity)}</div>
+          </div>
+          <div class="agent-room">${agent.room || 'idle'}</div>
+        `;
+        li.addEventListener('click', () => selectAgent(agent.id));
+        agentListEl.appendChild(li);
+      });
+    }
+
+    function renderSelected() {
+      const agent = state.agents.find((item) => item.id === state.selectedId) || null;
+      if (!agent) {
+        selectedSummaryEl.innerHTML = '<div class="empty">Select a sprite or wait for the first live snapshot.</div>';
+        selectedActivityEl.textContent = 'No activity yet.';
+        return;
+      }
+
+      selectedSummaryEl.innerHTML = `
+        <div class="meta-grid">
+          <div class="meta-item"><span class="label">Name</span><span class="value">${agent.display_name || agent.session_id}</span></div>
+          <div class="meta-item"><span class="label">Status</span><span class="value">${agent.status}</span></div>
+          <div class="meta-item"><span class="label">Source</span><span class="value">${agent.source || 'unknown'}</span></div>
+          <div class="meta-item"><span class="label">Room</span><span class="value">${agent.room || 'idle'}</span></div>
+          <div class="meta-item"><span class="label">Model</span><span class="value">${agent.model || 'n/a'}</span></div>
+          <div class="meta-item"><span class="label">Current Tool</span><span class="value">${agent.current_tool || 'n/a'}</span></div>
+          <div class="meta-item"><span class="label">Session ID</span><span class="value"><code class="inline">${agent.session_id || 'n/a'}</code></span></div>
+          <div class="meta-item"><span class="label">Last seen</span><span class="value">${formatTimestamp(agent.updated_at)}</span></div>
+          <div class="meta-item"><span class="label">Messages</span><span class="value">${agent.message_count ?? 'n/a'}</span></div>
+          <div class="meta-item"><span class="label">Tokens</span><span class="value">${agent.tokens ?? 0}</span></div>
+          <div class="meta-item" style="grid-column:1/-1;"><span class="label">Preview</span><span class="value">${agent.preview || agent.title || '—'}</span></div>
+        </div>
+      `;
+
+      selectedActivityEl.textContent = agent.activity || 'Waiting for input';
+    }
+
+    function selectAgent(id) {
+      state.selectedId = id;
+      renderAgentList();
+      renderSelected();
+    }
+
+    function computeTarget(agent, indexWithinRoom, roomCount) {
+      const room = roomById(agent.room || 'idle');
+      const cols = Math.max(1, Math.ceil(Math.sqrt(roomCount)));
+      const rows = Math.max(1, Math.ceil(roomCount / cols));
+      const col = indexWithinRoom % cols;
+      const row = Math.floor(indexWithinRoom / cols);
+      const baseX = room.x + 0.08 * room.w;
+      const baseY = room.y + 0.18 * room.h;
+      const stepX = (room.w * 0.78) / Math.max(cols, 1);
+      const stepY = (room.h * 0.62) / Math.max(rows, 1);
+      const jitterX = (seededNumber(agent.id, 91) - 0.5) * stepX * 0.28;
+      const jitterY = (seededNumber(agent.id, 191) - 0.5) * stepY * 0.28;
+      return {
+        x: baseX + (col + 0.5) * stepX + jitterX,
+        y: baseY + (row + 0.5) * stepY + jitterY,
+      };
+    }
+
+    function drawSprite(x, y, size, color, selected, agent) {
+      const px = size / 8;
+      ctx.save();
+      ctx.translate(x, y + Math.sin((performance.now() / 700) + seededNumber(agent.id, 5) * Math.PI * 2) * 4);
+      ctx.shadowColor = color;
+      ctx.shadowBlur = selected ? 20 : 10;
+      ctx.fillStyle = color;
+
+      ctx.globalAlpha = 0.2;
+      ctx.beginPath();
+      ctx.ellipse(0, size * 0.85, size * 0.68, size * 0.28, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      const blocks = [
+        [-1, -3], [0, -3],
+        [-2, -2], [-1, -2], [0, -2], [1, -2],
+        [-2, -1], [-1, -1], [0, -1], [1, -1],
+        [-1, 0], [0, 0],
+        [-2, 1], [-1, 1], [0, 1], [1, 1],
+        [-2, 2], [1, 2],
+      ];
+      blocks.forEach(([bx, by]) => ctx.fillRect(bx * px, by * px, px * 0.95, px * 0.95));
+
+      ctx.fillStyle = '#03111b';
+      ctx.fillRect(-px, -px, px * 0.8, px * 0.8);
+      ctx.fillRect(px * 0.2, -px, px * 0.8, px * 0.8);
+
+      if (selected) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.82)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(-3.2 * px, -4.2 * px, 6.4 * px, 8.2 * px);
+      }
+      ctx.restore();
+    }
+
+    function draw() {
+      const { width, height } = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const pixelWidth = Math.max(1, Math.floor(width * dpr));
+      const pixelHeight = Math.max(1, Math.floor(height * dpr));
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#060c12';
+      ctx.fillRect(0, 0, width, height);
+
+      for (let i = 0; i < 90; i += 1) {
+        const x = seededNumber(`star-${i}`, 11) * width;
+        const y = seededNumber(`star-${i}`, 29) * height;
+        const alpha = 0.1 + seededNumber(`star-${i}`, 37) * 0.35;
+        ctx.fillStyle = `rgba(171, 227, 255, ${alpha})`;
+        ctx.fillRect(x, y, 2, 2);
+      }
+
+      rooms.forEach((room) => {
+        const x = room.x * width;
+        const y = room.y * height;
+        const w = room.w * width;
+        const h = room.h * height;
+        const gradient = ctx.createLinearGradient(x, y, x + w, y + h);
+        gradient.addColorStop(0, `${room.tint}cc`);
+        gradient.addColorStop(1, `${room.tint}55`);
+        ctx.fillStyle = gradient;
+        ctx.strokeStyle = 'rgba(170, 225, 255, 0.1)';
+        ctx.lineWidth = 1.4;
+        roundRect(ctx, x, y, w, h, 22, true, true);
+        ctx.fillStyle = 'rgba(235, 248, 255, 0.9)';
+        ctx.font = '600 16px Inter, sans-serif';
+        ctx.fillText(room.label, x + 18, y + 28);
+      });
+
+      const grouped = new Map();
+      state.agents.forEach((agent) => {
+        const room = agent.room || 'idle';
+        if (!grouped.has(room)) grouped.set(room, []);
+        grouped.get(room).push(agent);
+      });
+
+      state.hitboxes = [];
+      grouped.forEach((agentsInRoom) => {
+        agentsInRoom.forEach((agent, index) => {
+          const target = computeTarget(agent, index, agentsInRoom.length);
+          const existing = state.positions.get(agent.id) || target;
+          const next = {
+            x: existing.x + (target.x - existing.x) * 0.12,
+            y: existing.y + (target.y - existing.y) * 0.12,
+          };
+          state.positions.set(agent.id, next);
+          const px = next.x * width;
+          const py = next.y * height;
+          const size = 36;
+          drawSprite(px, py, size, colorForAgent(agent), agent.id === state.selectedId, agent);
+          ctx.fillStyle = 'rgba(232, 245, 255, 0.92)';
+          ctx.font = '500 12px Inter, sans-serif';
+          ctx.fillText(agent.display_name || agent.session_id, px + 22, py + 6);
+          ctx.fillStyle = 'rgba(139, 165, 190, 0.92)';
+          ctx.font = '400 10px Inter, sans-serif';
+          ctx.fillText(agent.current_tool || agent.status, px + 22, py + 20);
+          state.hitboxes.push({ id: agent.id, x: px - 18, y: py - 20, w: 170, h: 44 });
+        });
+      });
+    }
+
+    function roundRect(context, x, y, w, h, radius, fill, stroke) {
+      const r = Math.min(radius, w / 2, h / 2);
+      context.beginPath();
+      context.moveTo(x + r, y);
+      context.arcTo(x + w, y, x + w, y + h, r);
+      context.arcTo(x + w, y + h, x, y + h, r);
+      context.arcTo(x, y + h, x, y, r);
+      context.arcTo(x, y, x + w, y, r);
+      context.closePath();
+      if (fill) context.fill();
+      if (stroke) context.stroke();
+    }
+
+    function animationLoop() {
+      draw();
+      requestAnimationFrame(animationLoop);
+    }
+
+    function applySnapshot(snapshot) {
+      state.snapshot = snapshot;
+      state.agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+      state.lastUpdateAt = Date.now();
+      renderCounts(snapshot);
+      renderAgentList();
+      if (!state.selectedId || !state.agents.some((agent) => agent.id === state.selectedId)) {
+        state.selectedId = state.agents[0]?.id || null;
+      }
+      renderSelected();
+      lastSyncEl.textContent = `Last sync ${new Date().toLocaleTimeString()}`;
+    }
+
+    async function fetchSnapshot() {
+      const resp = await fetch(SNAPSHOT_ENDPOINT, { cache: 'no-store' });
+      if (!resp.ok) throw new Error(`viewer snapshot ${resp.status}`);
+      return resp.json();
+    }
+
+    function startFallbackPolling() {
+      if (state.fallbackTimer) return;
+      state.fallbackTimer = window.setInterval(async () => {
+        try {
+          const snapshot = await fetchSnapshot();
+          applySnapshot(snapshot);
+          setConnectionState('reconnecting', 'Polling fallback');
+        } catch (error) {
+          console.error(error);
+          setConnectionState('error', 'Viewer offline');
+        }
+      }, 5000);
+    }
+
+    function stopFallbackPolling() {
+      if (!state.fallbackTimer) return;
+      clearInterval(state.fallbackTimer);
+      state.fallbackTimer = null;
+    }
+
+    function connectStream() {
+      if (state.stream) {
+        state.stream.close();
+      }
+      stopFallbackPolling();
+      setConnectionState('reconnecting', 'Connecting to gateway');
+      const stream = new EventSource(EVENTS_ENDPOINT);
+      state.stream = stream;
+      stream.onmessage = (event) => {
+        try {
+          const snapshot = JSON.parse(event.data);
+          state.lastPayload = event.data;
+          applySnapshot(snapshot);
+          setConnectionState('live', 'Live SSE stream');
+        } catch (error) {
+          console.error('bad viewer payload', error);
+        }
+      };
+      stream.onerror = async () => {
+        setConnectionState('reconnecting', 'Reconnecting…');
+        try {
+          const snapshot = await fetchSnapshot();
+          applySnapshot(snapshot);
+        } catch (error) {
+          console.error(error);
+        }
+        stream.close();
+        state.stream = null;
+        startFallbackPolling();
+        window.setTimeout(connectStream, 2500);
+      };
+    }
+
+    canvas.addEventListener('click', (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const hit = state.hitboxes.find((item) => x >= item.x && x <= item.x + item.w && y >= item.y && y <= item.y + item.h);
+      if (hit) {
+        selectAgent(hit.id);
+      }
+    });
+
+    window.addEventListener('resize', () => draw());
+
+    (async function init() {
+      try {
+        const snapshot = await fetchSnapshot();
+        applySnapshot(snapshot);
+      } catch (error) {
+        console.error(error);
+        setConnectionState('reconnecting', 'Initial snapshot unavailable');
+      }
+      animationLoop();
+      connectStream();
+    }());
+  </script>
+</body>
+</html>
