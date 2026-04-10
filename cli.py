@@ -4205,6 +4205,16 @@ class HermesCLI:
             )
             return cleaned.strip()
 
+        def _coerce_multimodal_text(value) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (list, tuple)):
+                pieces = [_coerce_multimodal_text(item) for item in value]
+                return " ".join(piece for piece in pieces if piece).strip()
+            return str(value)
+
         # Collect displayable entries (skip system, tool-result messages)
         entries = []  # list of (role, display_text)
         for msg in self.conversation_history:
@@ -4221,13 +4231,23 @@ class HermesCLI:
 
             if role == "user":
                 text = "" if content is None else str(content)
-                # Handle multimodal content (list of dicts)
+                # Handle multimodal content (list of dicts) robustly — some
+                # providers/plugins may serialize text parts as tuples/lists.
                 if isinstance(content, list):
                     parts = []
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                        elif isinstance(part, dict) and part.get("type") == "image_url":
+                        if isinstance(part, str):
+                            if part:
+                                parts.append(part)
+                            continue
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = str(part.get("type", "") or "")
+                        if ptype in {"text", "input_text", "output_text"} or "text" in part:
+                            piece = _coerce_multimodal_text(part.get("text", ""))
+                            if piece:
+                                parts.append(piece)
+                        elif ptype in {"image_url", "input_image"}:
                             parts.append("[image]")
                     text = " ".join(parts)
                 if len(text) > MAX_USER_LEN:

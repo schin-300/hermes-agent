@@ -138,6 +138,21 @@ def _multimodal_history():
     ]
 
 
+def _multimodal_history_with_tuple_text():
+    """Regression fixture: some multimodal text parts arrive as tuples/lists."""
+    return [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": ("What's", "in", "this", "image?")},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
+            ],
+        },
+        {"role": "assistant", "content": "I see a cat in the image."},
+    ]
+
+
 # ── Tests for _display_resumed_history ───────────────────────────────
 
 
@@ -245,6 +260,14 @@ class TestDisplayResumedHistory:
     def test_multimodal_content_handled(self):
         cli = _make_cli()
         cli.conversation_history = _multimodal_history()
+        output = self._capture_display(cli)
+
+        assert "What's in this image?" in output
+        assert "[image]" in output
+
+    def test_multimodal_tuple_text_does_not_crash(self):
+        cli = _make_cli()
+        cli.conversation_history = _multimodal_history_with_tuple_text()
         output = self._capture_display(cli)
 
         assert "What's in this image?" in output
