@@ -12,6 +12,7 @@ from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
 from hermes_cli.auth_tui import (
     CodexAuthTui,
     CodexLiveStatus,
+    CodexPoolAnalytics,
     CodexPoolDrainSample,
     CodexProfileSnapshot,
     CodexUsageWindow,
@@ -20,6 +21,7 @@ from hermes_cli.auth_tui import (
     SORT_REFRESH,
     STATE_AVAILABLE,
     STATE_DEACTIVATED,
+    STATE_ERROR,
     STATE_LIMITED,
     _KITTY_DIACRITICS,
     _KITTY_PLACEHOLDER,
@@ -28,6 +30,7 @@ from hermes_cli.auth_tui import (
     _build_kitty_transmission,
     _build_pool_drain_png_frame,
     _build_pool_drain_sample,
+    _compute_pool_analytics,
     _footer_line,
     _kitty_graphics_requested,
     _pool_drain_points,
@@ -982,3 +985,181 @@ def test_auth_view_command_passes_poll_interval_to_tui(monkeypatch):
     assert captured["timeout_seconds"] == 3.0
     assert captured["auto_refresh_interval_seconds"] == 7.5
     assert captured["ran"] is True
+
+
+def _make_snapshot(entry_id, state, primary_pct=None, secondary_pct=None):
+    primary = CodexUsageWindow(label="5h", used_percent=100.0 - primary_pct) if primary_pct is not None else None
+    secondary = CodexUsageWindow(label="Week", used_percent=100.0 - secondary_pct) if secondary_pct is not None else None
+    state_badges = {STATE_AVAILABLE: "AVAIL", STATE_LIMITED: "LIMIT", STATE_DEACTIVATED: "DEAD", STATE_ERROR: "ERR"}
+    auth_badges = {STATE_AVAILABLE: "OK", STATE_LIMITED: "OK", STATE_DEACTIVATED: "DEAD", STATE_ERROR: "ERR"}
+    return CodexProfileSnapshot(
+        index=0,
+        entry_id=entry_id,
+        label=entry_id,
+        display_name=entry_id,
+        auth_badge=auth_badges.get(state, "?"),
+        state=state,
+        state_badge=state_badges.get(state, "?"),
+        state_reason="test",
+        primary_window=primary,
+        secondary_window=secondary,
+    )
+
+
+def test_compute_pool_analytics_tracks_combined_averages_medians_and_ready_accounts():
+    snapshots = [
+        _make_snapshot("a", STATE_AVAILABLE, primary_pct=80.0, secondary_pct=90.0),
+        _make_snapshot("b", STATE_AVAILABLE, primary_pct=60.0, secondary_pct=20.0),
+        _make_snapshot("c", STATE_LIMITED, primary_pct=0.0, secondary_pct=50.0),
+        _make_snapshot("d", STATE_DEACTIVATED),
+        _make_snapshot("e", STATE_ERROR),
+    ]
+    result = _compute_pool_analytics(snapshots)
+    assert isinstance(result, CodexPoolAnalytics)
+    assert result.total == 5
+    assert result.auth_ok == 3
+    assert result.available == 2
+    assert result.limited == 1
+    assert result.deactivated == 1
+    assert result.error == 1
+    assert result.loading == 0
+    assert result.primary_label == "5h"
+    assert result.primary_tracked == 3
+    assert abs(result.primary_average_available_pct - (140.0 / 3.0)) < 0.01
+    assert result.primary_median_available_pct == 60.0
+    assert result.primary_total_available_pct == 140.0
+    assert result.secondary_label == "Week"
+    assert result.secondary_tracked == 3
+    assert abs(result.secondary_average_available_pct - (160.0 / 3.0)) < 0.01
+    assert result.secondary_median_available_pct == 50.0
+    assert result.secondary_total_available_pct == 160.0
+    assert result.bottleneck_tracked == 3
+    assert abs(result.bottleneck_average_available_pct - (100.0 / 3.0)) < 0.01
+    assert result.bottleneck_median_available_pct == 20.0
+    assert result.ready_accounts == 2
+
+
+def test_compute_pool_analytics_empty_returns_zeroed():
+    result = _compute_pool_analytics([])
+    assert result.total == 0
+    assert result.auth_ok == 0
+    assert result.available == 0
+    assert result.limited == 0
+    assert result.deactivated == 0
+    assert result.error == 0
+    assert result.loading == 0
+    assert result.primary_tracked == 0
+    assert result.primary_average_available_pct == 0.0
+    assert result.primary_median_available_pct == 0.0
+    assert result.primary_total_available_pct == 0.0
+    assert result.secondary_tracked == 0
+    assert result.secondary_average_available_pct == 0.0
+    assert result.secondary_median_available_pct == 0.0
+    assert result.secondary_total_available_pct == 0.0
+    assert result.bottleneck_tracked == 0
+    assert result.bottleneck_average_available_pct == 0.0
+    assert result.bottleneck_median_available_pct == 0.0
+    assert result.ready_accounts == 0
+
+
+def test_compute_pool_analytics_skips_missing_windows_and_only_counts_ready_with_both_windows():
+    snapshots = [
+        _make_snapshot("a", STATE_AVAILABLE, primary_pct=50.0, secondary_pct=None),
+        _make_snapshot("b", STATE_AVAILABLE, primary_pct=None, secondary_pct=90.0),
+        _make_snapshot("c", STATE_AVAILABLE, primary_pct=40.0, secondary_pct=30.0),
+    ]
+    result = _compute_pool_analytics(snapshots)
+    assert result.total == 3
+    assert result.auth_ok == 3
+    assert result.available == 3
+    assert result.primary_tracked == 2
+    assert abs(result.primary_average_available_pct - 45.0) < 0.01
+    assert result.primary_median_available_pct == 45.0
+    assert result.primary_total_available_pct == 90.0
+    assert result.secondary_tracked == 2
+    assert abs(result.secondary_average_available_pct - 60.0) < 0.01
+    assert result.secondary_median_available_pct == 60.0
+    assert result.secondary_total_available_pct == 120.0
+    assert result.bottleneck_tracked == 1
+    assert result.bottleneck_average_available_pct == 30.0
+    assert result.bottleneck_median_available_pct == 30.0
+    assert result.ready_accounts == 1
+
+
+def test_overview_summary_lines_show_multi_account_rollups_and_runway():
+    tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0, kitty_meter=False)
+    tui.snapshots = [
+        _make_snapshot("a", STATE_AVAILABLE, primary_pct=80.0, secondary_pct=90.0),
+        _make_snapshot("b", STATE_AVAILABLE, primary_pct=60.0, secondary_pct=20.0),
+        _make_snapshot("c", STATE_LIMITED, primary_pct=0.0, secondary_pct=50.0),
+        _make_snapshot("d", STATE_DEACTIVATED),
+    ]
+    tui._pool_drain_history = [
+        CodexPoolDrainSample(
+            captured_at=10.0,
+            label="5h",
+            rate_percent_per_hour=25.0,
+            total_drop_percent=12.5,
+            dropping_accounts=2,
+            compared_accounts=3,
+            tracked_accounts=3,
+            resetting_accounts=0,
+            average_available_percent=140.0 / 3.0,
+            total_available_percent=140.0,
+            total_capacity_percent=300.0,
+        )
+    ]
+
+    lines = tui._overview_summary_lines(width=120)
+    joined = "\n".join(lines)
+
+    assert "tracked 5h=3" in joined
+    assert "tracked Week=3" in joined
+    assert "both=3" in joined
+    assert "ready>5%=2" in joined
+    assert "5h avg" in joined
+    assert "eq 1.4 acct" in joined
+    assert "Week avg" in joined
+    assert "eq 1.6 acct" in joined
+    assert "both-window avg" in joined
+    assert "5h runway 5.6h" in joined
+
+
+def test_render_codex_auth_smoke_test_includes_pool_summary(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 0)
+    snapshots = [
+        CodexProfileSnapshot(
+            index=1,
+            entry_id="cred-1",
+            label="available@example.com",
+            display_name="available@example.com",
+            auth_badge="OK",
+            state=STATE_AVAILABLE,
+            state_badge="AVAIL",
+            state_reason="Available",
+            primary_window=CodexUsageWindow(label="5h", used_percent=18, reset_at_ms=5 * 60 * 60 * 1000),
+            secondary_window=CodexUsageWindow(label="Week", used_percent=6, reset_at_ms=(6 * 24 + 23) * 60 * 60 * 1000),
+        ),
+        CodexProfileSnapshot(
+            index=2,
+            entry_id="cred-2",
+            label="dead@example.com",
+            display_name="dead@example.com",
+            auth_badge="DEAD",
+            state=STATE_DEACTIVATED,
+            state_badge="n/a",
+            state_reason="HTTP 401",
+            primary_window=None,
+            secondary_window=None,
+        ),
+    ]
+    monkeypatch.setattr("hermes_cli.auth_tui.build_codex_profile_snapshots", lambda **kwargs: snapshots)
+
+    output = render_codex_auth_smoke_test()
+
+    assert "Pool analytics" in output
+    assert "tracked 5h=1" in output
+    assert "tracked Week=1" in output
+    assert "ready>5%=1" in output
+    assert "5h avg  82%" in output
+    assert "Week avg  94%" in output

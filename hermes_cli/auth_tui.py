@@ -21,6 +21,7 @@ import fcntl
 import locale
 import math
 import os
+import statistics
 import struct
 import sys
 import termios
@@ -53,6 +54,7 @@ KITTY_METER_MIN_WIDTH = 96
 KITTY_METER_MIN_HEIGHT = 20
 MAX_POOL_DRAIN_SAMPLES = 64
 MAX_VISIBLE_POOL_DRAIN_POLLS = 30
+READY_ACCOUNT_THRESHOLD_PERCENT = 5.0
 REFRESH_SCOPE_ALL = "all"
 _KITTY_PLACEHOLDER = "\U0010EEEE"
 _KITTY_CHUNK_SIZE = 4096
@@ -237,6 +239,32 @@ class CodexProfileSnapshot:
 
 
 @dataclass
+class CodexPoolAnalytics:
+    total: int = 0
+    auth_ok: int = 0
+    available: int = 0
+    limited: int = 0
+    deactivated: int = 0
+    error: int = 0
+    loading: int = 0
+    primary_label: str = "5h"
+    primary_tracked: int = 0
+    primary_average_available_pct: float = 0.0
+    primary_median_available_pct: float = 0.0
+    primary_total_available_pct: float = 0.0
+    secondary_label: str = "Week"
+    secondary_tracked: int = 0
+    secondary_average_available_pct: float = 0.0
+    secondary_median_available_pct: float = 0.0
+    secondary_total_available_pct: float = 0.0
+    bottleneck_tracked: int = 0
+    bottleneck_average_available_pct: float = 0.0
+    bottleneck_median_available_pct: float = 0.0
+    ready_accounts: int = 0
+    ready_threshold_pct: float = READY_ACCOUNT_THRESHOLD_PERCENT
+
+
+@dataclass
 class CodexPoolDrainSample:
     captured_at: float
     label: str
@@ -375,6 +403,40 @@ def _window_available_percent(window: Optional[CodexUsageWindow]) -> Optional[fl
 
 def _window_is_exhausted(window: Optional[CodexUsageWindow]) -> bool:
     return bool(window and window.used_percent >= 99.5)
+
+
+def _median_percent(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(statistics.median(values))
+
+
+def _format_account_equivalent(total_available_percent: float) -> str:
+    return f"{(max(0.0, float(total_available_percent)) / 100.0):.1f} acct"
+
+
+def _format_runway_duration(hours: Optional[float]) -> str:
+    if hours is None:
+        return "warming up"
+    if math.isinf(hours):
+        return "idle"
+    if hours < 0:
+        hours = 0.0
+    if hours >= 48.0:
+        return f"{hours / 24.0:.1f}d"
+    return f"{hours:.1f}h"
+
+
+def _primary_runway_hours(
+    total_available_percent: float,
+    latest_sample: Optional[CodexPoolDrainSample],
+) -> Optional[float]:
+    if latest_sample is None:
+        return None
+    rate = max(0.0, float(latest_sample.rate_percent_per_hour))
+    if rate <= 0.05:
+        return math.inf
+    return max(0.0, float(total_available_percent)) / rate
 
 
 def _collect_primary_window_state(
@@ -1540,6 +1602,119 @@ def build_codex_profile_placeholders(provider: str = DEFAULT_PROVIDER) -> list[C
     return [_snapshot_from_entry(index, entry) for index, entry in enumerate(pool.entries(), start=1)]
 
 
+def _compute_pool_analytics(snapshots: list[CodexProfileSnapshot]) -> CodexPoolAnalytics:
+    if not snapshots:
+        return CodexPoolAnalytics()
+
+    auth_ok = available = limited = deactivated = error = loading = 0
+    primary_label = "5h"
+    secondary_label = "Week"
+    primary_values: list[float] = []
+    secondary_values: list[float] = []
+    bottleneck_values: list[float] = []
+    ready_accounts = 0
+
+    for snapshot in snapshots:
+        if snapshot.auth_badge == "OK":
+            auth_ok += 1
+        if snapshot.state == STATE_AVAILABLE:
+            available += 1
+        elif snapshot.state == STATE_LIMITED:
+            limited += 1
+        elif snapshot.state == STATE_DEACTIVATED:
+            deactivated += 1
+        elif snapshot.state == STATE_ERROR:
+            error += 1
+        elif snapshot.state == STATE_LOADING:
+            loading += 1
+
+        primary_value = _window_available_percent(snapshot.primary_window)
+        if primary_value is not None:
+            primary_values.append(primary_value)
+            if snapshot.primary_window and snapshot.primary_window.label:
+                primary_label = snapshot.primary_window.label
+
+        secondary_value = _window_available_percent(snapshot.secondary_window)
+        if secondary_value is not None:
+            secondary_values.append(secondary_value)
+            if snapshot.secondary_window and snapshot.secondary_window.label:
+                secondary_label = snapshot.secondary_window.label
+
+        if primary_value is not None and secondary_value is not None:
+            bottleneck = min(primary_value, secondary_value)
+            bottleneck_values.append(bottleneck)
+            if snapshot.auth_badge == "OK" and bottleneck >= READY_ACCOUNT_THRESHOLD_PERCENT:
+                ready_accounts += 1
+
+    primary_total = sum(primary_values)
+    secondary_total = sum(secondary_values)
+    return CodexPoolAnalytics(
+        total=len(snapshots),
+        auth_ok=auth_ok,
+        available=available,
+        limited=limited,
+        deactivated=deactivated,
+        error=error,
+        loading=loading,
+        primary_label=primary_label,
+        primary_tracked=len(primary_values),
+        primary_average_available_pct=(primary_total / len(primary_values)) if primary_values else 0.0,
+        primary_median_available_pct=_median_percent(primary_values),
+        primary_total_available_pct=primary_total,
+        secondary_label=secondary_label,
+        secondary_tracked=len(secondary_values),
+        secondary_average_available_pct=(secondary_total / len(secondary_values)) if secondary_values else 0.0,
+        secondary_median_available_pct=_median_percent(secondary_values),
+        secondary_total_available_pct=secondary_total,
+        bottleneck_tracked=len(bottleneck_values),
+        bottleneck_average_available_pct=(sum(bottleneck_values) / len(bottleneck_values)) if bottleneck_values else 0.0,
+        bottleneck_median_available_pct=_median_percent(bottleneck_values),
+        ready_accounts=ready_accounts,
+    )
+
+
+def _pool_analytics_lines(
+    analytics: CodexPoolAnalytics,
+    *,
+    latest_sample: Optional[CodexPoolDrainSample] = None,
+) -> list[str]:
+    if analytics.total <= 0:
+        return [
+            "Pool analytics  •  no pooled Codex profiles found",
+            "5h avg n/a  •  Week avg n/a",
+            "both-window avg n/a  •  5h runway warming up",
+        ]
+
+    runway_hours = _primary_runway_hours(analytics.primary_total_available_pct, latest_sample)
+    runway_text = _format_runway_duration(runway_hours)
+    if latest_sample is None:
+        runway_suffix = f"{analytics.primary_label} runway {runway_text}"
+    else:
+        rate = max(0.0, float(latest_sample.rate_percent_per_hour))
+        if math.isinf(runway_hours):
+            runway_suffix = f"{analytics.primary_label} runway idle @ {rate:.1f} pool-%/h"
+        else:
+            runway_suffix = f"{analytics.primary_label} runway {runway_text} @ {rate:.1f} pool-%/h"
+
+    return [
+        (
+            f"Pool analytics  •  tracked {analytics.primary_label}={analytics.primary_tracked}  "
+            f"tracked {analytics.secondary_label}={analytics.secondary_tracked}  both={analytics.bottleneck_tracked}  •  "
+            f"ready>{analytics.ready_threshold_pct:.0f}%={analytics.ready_accounts}"
+        ),
+        (
+            f"{analytics.primary_label} avg {_format_percent(analytics.primary_average_available_pct)} med {_format_percent(analytics.primary_median_available_pct)} "
+            f"eq {_format_account_equivalent(analytics.primary_total_available_pct)}  •  "
+            f"{analytics.secondary_label} avg {_format_percent(analytics.secondary_average_available_pct)} med {_format_percent(analytics.secondary_median_available_pct)} "
+            f"eq {_format_account_equivalent(analytics.secondary_total_available_pct)}"
+        ),
+        (
+            f"both-window avg {_format_percent(analytics.bottleneck_average_available_pct)} med {_format_percent(analytics.bottleneck_median_available_pct)}  •  "
+            f"{runway_suffix}"
+        ),
+    ]
+
+
 def render_codex_auth_smoke_test(
     *,
     provider: str = DEFAULT_PROVIDER,
@@ -1562,6 +1737,9 @@ def render_codex_auth_smoke_test(
             f"{snapshot.index:>2}. {snapshot.display_name:<30} {snapshot.auth_badge:<4} {snapshot.state_badge:<5} "
             f"{long_label}_left={long_pct}{long_suffix} {short_label}_left={short_pct}{short_suffix}"
         )
+    analytics = _compute_pool_analytics(snapshots)
+    lines.append("")
+    lines.extend(_pool_analytics_lines(analytics))
     return "\n".join(lines)
 
 
@@ -1825,6 +2003,13 @@ class CodexAuthTui:
         self._last_primary_available = current_by_id
         self._last_primary_capture_at = captured_at
 
+    def _overview_summary_lines(self, width: int) -> list[str]:
+        with self._lock:
+            snapshots = list(self.snapshots)
+            latest = self._pool_drain_history[-1] if self._pool_drain_history else None
+        analytics = _compute_pool_analytics(snapshots)
+        return [_clip(line, width - 1) for line in _pool_analytics_lines(analytics, latest_sample=latest)]
+
     def _graph_rows(self, width: int, height: int) -> int:
         if not self.kitty_meter_enabled:
             return 0
@@ -2062,8 +2247,16 @@ class CodexAuthTui:
             stdscr.addnstr(0, 0, _clip(header, max_x - 1), max_x - 1, header_attr)
 
             dim_attr = curses.color_pair(6) if curses.has_colors() else curses.A_DIM
+            overview_top = 1
+            overview_lines = self._overview_summary_lines(max_x)
+            for line_offset, overview_line in enumerate(overview_lines, start=overview_top):
+                overview_attr = curses.A_BOLD if line_offset == overview_top else dim_attr
+                if curses.has_colors() and line_offset == overview_top:
+                    overview_attr |= curses.color_pair(4)
+                stdscr.addnstr(line_offset, 0, overview_line, max_x - 1, overview_attr)
+
             graph_rows = self._graph_rows(max_x, max_y)
-            graph_summary_top = 1
+            graph_summary_top = overview_top + len(overview_lines)
             graph_summary_lines = self._graph_summary_lines(max_x) if graph_rows else []
             for line_offset, summary_line in enumerate(graph_summary_lines, start=graph_summary_top):
                 if line_offset == graph_summary_top:
