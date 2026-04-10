@@ -1001,6 +1001,29 @@ class TestRunsCancellation:
         assert queued["event"] == "run.cancelled"
         assert queued["run_id"] == run_id
 
+    @pytest.mark.asyncio
+    async def test_run_events_uses_short_keepalive_timeout(self, adapter):
+        app = _create_app(adapter)
+        run_id = "run_keepalive_timeout"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_streams_created[run_id] = time.time()
+        seen = {}
+
+        async def _fake_wait_for(awaitable, timeout):
+            seen["timeout"] = timeout
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            return None
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server.asyncio.wait_for", side_effect=_fake_wait_for):
+                resp = await cli.get(f"/v1/runs/{run_id}/events")
+                assert resp.status == 200
+                await resp.text()
+
+        assert seen["timeout"] == adapter._RUN_EVENTS_KEEPALIVE
+        assert seen["timeout"] <= 1.0
+
 
 # ---------------------------------------------------------------------------
 # Multiple system messages
