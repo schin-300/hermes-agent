@@ -13,6 +13,7 @@ Improvements over v1:
   - Richer tool call/result detail in summarizer input
 """
 
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -148,6 +149,84 @@ class ContextCompressor:
             "compression_count": self.compression_count,
         }
 
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        """Best-effort text rendering for multimodal and non-string content."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            try:
+                return json.dumps(content, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                return str(content)
+
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type", "") or "")
+            if ptype in {"text", "input_text", "output_text"}:
+                text = str(part.get("text", "") or "")
+                if text:
+                    parts.append(text)
+            elif ptype in {"image_url", "input_image"}:
+                parts.append("[image]")
+            elif ptype in {"audio", "audio_url", "input_audio"}:
+                parts.append("[audio]")
+            elif ptype:
+                parts.append(f"[{ptype}]")
+        return " ".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _content_text_block_type(content: Any) -> str:
+        """Choose a compatible text block type when extending multimodal content."""
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = str(part.get("type", "") or "")
+                if ptype in {"text", "input_text", "output_text"}:
+                    return ptype
+        return "text"
+
+    @classmethod
+    def _append_text_to_content(cls, content: Any, text: str) -> Any:
+        """Append text while preserving multimodal list content when possible."""
+        if not text:
+            return content
+        if content is None:
+            return text
+        if isinstance(content, str):
+            return content + text
+        if isinstance(content, list):
+            return [
+                *content,
+                {"type": cls._content_text_block_type(content), "text": text},
+            ]
+        return cls._content_to_text(content) + text
+
+    @classmethod
+    def _prepend_text_to_content(cls, text: str, content: Any) -> Any:
+        """Prepend text while preserving multimodal list content when possible."""
+        if not text:
+            return content
+        if content is None:
+            return text
+        if isinstance(content, str):
+            return text + content
+        if isinstance(content, list):
+            return [
+                {"type": cls._content_text_block_type(content), "text": text},
+                *content,
+            ]
+        return text + cls._content_to_text(content)
+
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
@@ -180,7 +259,7 @@ class ContextCompressor:
             min_protect = min(protect_tail_count, len(result) - 1)
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
-                content_len = len(msg.get("content") or "")
+                content_len = len(self._content_to_text(msg.get("content")))
                 msg_tokens = content_len // _CHARS_PER_TOKEN + 10
                 for tc in msg.get("tool_calls") or []:
                     if isinstance(tc, dict):
@@ -200,10 +279,11 @@ class ContextCompressor:
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content", "")
-            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
+            content_text = self._content_to_text(content)
+            if not content_text or content_text == _PRUNED_TOOL_PLACEHOLDER:
                 continue
             # Only prune if the content is substantial (>200 chars)
-            if len(content) > 200:
+            if len(content_text) > 200:
                 result[i] = {**msg, "content": _PRUNED_TOOL_PLACEHOLDER}
                 pruned += 1
 
@@ -243,7 +323,7 @@ class ContextCompressor:
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = self._content_to_text(msg.get("content"))
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":
@@ -577,7 +657,7 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            content = msg.get("content") or ""
+            content = self._content_to_text(msg.get("content"))
             msg_tokens = len(content) // _CHARS_PER_TOKEN + 10  # +10 for role/metadata
             # Include tool call arguments in estimate
             for tc in msg.get("tool_calls") or []:
@@ -685,9 +765,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         for i in range(compress_start):
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system" and self.compression_count == 0:
-                msg["content"] = (
-                    (msg.get("content") or "")
-                    + "\n\n[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
+                msg["content"] = self._append_text_to_content(
+                    msg.get("content"),
+                    "\n\n[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]",
                 )
             compressed.append(msg)
 
@@ -732,8 +812,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
             if _merge_summary_into_tail and i == compress_end:
-                original = msg.get("content") or ""
-                msg["content"] = summary + "\n\n" + original
+                msg["content"] = self._prepend_text_to_content(f"{summary}\n\n", msg.get("content"))
                 _merge_summary_into_tail = False
             compressed.append(msg)
 

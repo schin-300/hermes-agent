@@ -118,6 +118,137 @@ class TestCompress:
         assert msgs[-2]["content"] in result[-2]["content"]
 
 
+class TestMultimodalContent:
+    def test_content_to_text_flattens_multimodal_blocks(self, compressor):
+        content = [
+            {"type": "input_text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            {"type": "audio", "audio": {"id": "clip-1"}},
+            {"type": "tool_result"},
+        ]
+
+        result = compressor._content_to_text(content)
+
+        assert "What is in this image?" in result
+        assert "[image]" in result
+        assert "[audio]" in result
+        assert "[tool_result]" in result
+
+    def test_generate_summary_flattens_multimodal_prompt(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: multimodal summary"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Please inspect this image"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                ],
+            },
+            {"role": "assistant", "content": "It looks like a cat."},
+            {"role": "user", "content": "thanks"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            summary = c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert isinstance(summary, str)
+        assert "Please inspect this image" in prompt
+        assert "[image]" in prompt
+        assert "image_url" not in prompt
+
+    def test_compress_preserves_multimodal_system_message(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: compressed middle"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "System prompt"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/rules.png"}},
+                ],
+            },
+            *[
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+                for i in range(10)
+            ],
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        assert isinstance(result[0]["content"], list)
+        assert result[0]["content"][0] == {"type": "text", "text": "System prompt"}
+        assert result[0]["content"][1]["type"] == "image_url"
+        assert result[0]["content"][-1]["type"] == "text"
+        assert "Some earlier conversation turns have been compacted" in result[0]["content"][-1]["text"]
+
+    def test_double_collision_preserves_multimodal_tail_message(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=3)
+
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "msg 6"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/tail.png"}},
+                ],
+            },
+            {"role": "assistant", "content": "msg 7"},
+            {"role": "user", "content": "msg 8"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        merged_tail = next(
+            msg
+            for msg in result
+            if isinstance(msg.get("content"), list)
+            and any(
+                isinstance(part, dict)
+                and part.get("type") == "image_url"
+                for part in msg["content"]
+            )
+        )
+        assert merged_tail["content"][0]["type"] == "text"
+        assert merged_tail["content"][0]["text"].startswith(SUMMARY_PREFIX)
+        assert merged_tail["content"][0]["text"].endswith("summary text\n\n")
+        assert any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and part.get("text") == "msg 6"
+            for part in merged_tail["content"]
+        )
+        assert any(
+            isinstance(part, dict)
+            and part.get("type") == "image_url"
+            for part in merged_tail["content"]
+        )
+
+
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 
