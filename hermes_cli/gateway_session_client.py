@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -32,9 +34,9 @@ def resolve_gateway_session_endpoint() -> GatewaySessionEndpoint:
     platform_cfg = config.platforms.get(Platform.API_SERVER)
     extra = dict(getattr(platform_cfg, "extra", {}) or {})
 
-    host = str(extra.get("host") or DEFAULT_HOST)
-    port = int(extra.get("port") or DEFAULT_PORT)
-    api_key = extra.get("key") or None
+    host = str(os.getenv("API_SERVER_HOST") or extra.get("host") or DEFAULT_HOST)
+    port = int(os.getenv("API_SERVER_PORT") or extra.get("port") or DEFAULT_PORT)
+    api_key = os.getenv("API_SERVER_KEY") or extra.get("key") or None
     return GatewaySessionEndpoint(base_url=f"http://{host}:{port}", api_key=api_key)
 
 
@@ -47,6 +49,30 @@ def check_gateway_session_endpoint(endpoint: GatewaySessionEndpoint, timeout: fl
     except Exception:
         return False
     return payload.get("status") == "ok"
+
+
+def ensure_gateway_session_bridge(timeout: float = 15.0, autostart: bool = True) -> GatewaySessionEndpoint:
+    """Ensure the local gateway-backed session bridge is running and reachable."""
+    endpoint = resolve_gateway_session_endpoint()
+    if check_gateway_session_endpoint(endpoint):
+        return endpoint
+    if not autostart:
+        raise GatewaySessionClientError("Gateway session bridge is not running")
+
+    from hermes_cli.gateway import launch_gateway_background
+
+    if not launch_gateway_background():
+        raise GatewaySessionClientError("Failed to launch the Hermes gateway in the background")
+
+    deadline = time.time() + max(timeout, 1.0)
+    while time.time() < deadline:
+        if check_gateway_session_endpoint(endpoint):
+            return endpoint
+        time.sleep(0.25)
+
+    raise GatewaySessionClientError(
+        f"Gateway session bridge did not become ready at {endpoint.base_url} within {timeout:.1f}s"
+    )
 
 
 class GatewaySessionAgentProxy:
@@ -95,10 +121,12 @@ class GatewaySessionAgentProxy:
             context_length=context_length_override,
             threshold_percent=compression_threshold,
         )
+        self.gateway_hosted_session = True
         self.compression_enabled = False
         self._checkpoint_mgr = SimpleNamespace(enabled=False)
         self._active_children: list[Any] = []
         self._interrupt_requested = False
+        self._detach_requested = False
         self._interrupt_message: Optional[str] = None
         self._active_run_id: Optional[str] = None
         self._active_events_response: Any = None
@@ -189,6 +217,7 @@ class GatewaySessionAgentProxy:
         final_response = ""
         failed = False
         interrupted = False
+        detached = False
         error_message: Optional[str] = None
         usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
@@ -205,6 +234,7 @@ class GatewaySessionAgentProxy:
             self._active_run_id = run_id
             self._active_events_response = events_response
             self._interrupt_requested = False
+            self._detach_requested = False
             self._interrupt_message = None
 
         try:
@@ -265,14 +295,19 @@ class GatewaySessionAgentProxy:
                     interrupted = True
                     error_message = self._interrupt_message or str(event.get("reason") or "Interrupted")
 
-            if not final_response:
+            if self._detach_requested:
+                detached = True
+                final_response = ""
+            elif not final_response:
                 final_response = "".join(streamed_chunks)
             if self._interrupt_requested:
                 interrupted = True
                 error_message = self._interrupt_message or error_message or "Interrupted"
 
         except Exception as exc:
-            if self._interrupt_requested:
+            if self._detach_requested:
+                detached = True
+            elif self._interrupt_requested:
                 interrupted = True
                 error_message = self._interrupt_message or "Interrupted"
             else:
@@ -301,9 +336,10 @@ class GatewaySessionAgentProxy:
             "final_response": final_response,
             "messages": messages,
             "api_calls": 1,
-            "completed": not failed and not interrupted,
+            "completed": not failed and not interrupted and not detached,
             "failed": failed,
             "interrupted": interrupted,
+            "detached": detached,
             "response_previewed": bool(streamed_chunks),
         }
         if reasoning_text:
@@ -317,6 +353,7 @@ class GatewaySessionAgentProxy:
     def interrupt(self, message: Optional[str] = None) -> None:
         with self._active_lock:
             self._interrupt_requested = True
+            self._detach_requested = False
             self._interrupt_message = message or "Interrupted"
             run_id = self._active_run_id
             response = self._active_events_response
@@ -331,6 +368,17 @@ class GatewaySessionAgentProxy:
                 cancel_response.raise_for_status()
             except Exception:
                 logger.debug("Gateway run cancel failed for %s", run_id, exc_info=True)
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def detach(self) -> None:
+        with self._active_lock:
+            self._detach_requested = True
+            response = self._active_events_response
+
         if response is not None:
             try:
                 response.close()
@@ -370,6 +418,7 @@ class GatewaySessionAgentProxy:
 
     def reset_session_state(self) -> None:
         self._interrupt_requested = False
+        self._detach_requested = False
         self._interrupt_message = None
 
     def flush_memories(self, conversation_history: Optional[list[dict[str, Any]]] = None) -> None:

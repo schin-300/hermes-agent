@@ -129,6 +129,16 @@ class TestGatewayStopCleanup:
         # Global kill should NOT be called without --all
         assert kill_calls == []
 
+    def test_close_alias_stops_current_profile_gateway(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        calls = []
+        monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: calls.append("close") or True)
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="close", all=False, system=False))
+
+        assert calls == ["close"]
+
     def test_stop_all_sweeps_all_gateway_processes(self, tmp_path, monkeypatch):
         """With --all, stop uses systemd AND calls the global kill_gateway_processes()."""
         unit_path = tmp_path / "hermes-gateway.service"

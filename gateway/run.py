@@ -497,18 +497,43 @@ def _load_gateway_config() -> dict:
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
-    """Read model from config.yaml — single source of truth.
+    """Read model from config.yaml and fall back to the active provider default.
 
-    Without this, temporary AIAgent instances (memory flush, /compress) fall
-    back to the hardcoded default which fails when the active provider is
-    openai-codex.
+    Without this, temporary AIAgent instances (memory flush, /compress, API
+    server runs, gateway-backed CLI chats) can end up with an empty model name,
+    which fails for providers like Nous and Codex.
     """
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
+    configured_provider = ""
+
     if isinstance(model_cfg, str):
-        return model_cfg
+        model_name = model_cfg.strip()
+        if model_name:
+            return model_name
     elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
+        model_name = str(model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name") or "").strip()
+        if model_name:
+            return model_name
+        configured_provider = str(model_cfg.get("provider") or "").strip()
+
+    try:
+        from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS, normalize_provider
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        requested_provider = configured_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or None
+        runtime = resolve_runtime_provider(requested=requested_provider)
+        resolved_provider = normalize_provider(runtime.get("provider") or requested_provider)
+
+        if resolved_provider == "openrouter":
+            return OPENROUTER_MODELS[0][0] if OPENROUTER_MODELS else ""
+
+        provider_models = _PROVIDER_MODELS.get(resolved_provider, [])
+        if provider_models:
+            return str(provider_models[0]).strip()
+    except Exception:
+        logger.debug("Could not derive fallback gateway model", exc_info=True)
+
     return ""
 
 

@@ -587,6 +587,7 @@ def cmd_chat(args):
 
     gateway_session_mode = (
         not getattr(args, "query", None)
+        and sys.stdin.isatty()
         and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
         not in {"0", "false", "no", "off"}
     )
@@ -621,20 +622,10 @@ def cmd_chat(args):
 
     if gateway_session_mode:
         try:
-            from hermes_cli.gateway_session_client import (
-                check_gateway_session_endpoint,
-                resolve_gateway_session_endpoint,
-            )
-            endpoint = resolve_gateway_session_endpoint()
-            if not check_gateway_session_endpoint(endpoint):
-                print()
-                print("Hermes interactive chat now requires a running local gateway session bridge.")
-                print()
-                print("  Start it with:  hermes gateway run")
-                print()
-                sys.exit(1)
+            from hermes_cli.gateway_session_client import ensure_gateway_session_bridge
+            ensure_gateway_session_bridge()
         except Exception as exc:
-            print(f"Error checking gateway session bridge: {exc}")
+            print(f"Error starting gateway session bridge: {exc}")
             sys.exit(1)
 
     # Start update check in background (runs while other init happens)
@@ -4472,6 +4463,11 @@ For more help on a command:
     gateway_stop = gateway_subparsers.add_parser("stop", help="Stop gateway service")
     gateway_stop.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
     gateway_stop.add_argument("--all", action="store_true", help="Stop ALL gateway processes across all profiles")
+
+    # gateway close (same as stop; explicit user-facing wording for hosted sessions)
+    gateway_close = gateway_subparsers.add_parser("close", help="Close the hosted gateway for this profile")
+    gateway_close.add_argument("--system", action="store_true", help="Target the Linux system-level gateway service")
+    gateway_close.add_argument("--all", action="store_true", help="Close ALL gateway processes across all profiles")
     
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser("restart", help="Restart gateway service")

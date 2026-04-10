@@ -1687,6 +1687,7 @@ class HermesCLI:
         self._tool_boundary_input_queue = queue.Queue()
         self._active_agent_thread = None
         self._should_exit = False
+        self._detaching_gateway_session = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
         self._clarify_freetext = False
@@ -1731,6 +1732,20 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+
+    def _detach_gateway_session_and_exit(self, event, *, message: str) -> bool:
+        """Detach this terminal client from a gateway-hosted session without cancelling it."""
+        if not (self.gateway_session_mode and self._agent_running and self.agent and hasattr(self.agent, "detach")):
+            return False
+        self._detaching_gateway_session = True
+        self._should_exit = True
+        print(f"\n{message}")
+        try:
+            self.agent.detach()
+        except Exception:
+            logger.debug("Failed to detach gateway session cleanly", exc_info=True)
+        event.app.exit()
+        return True
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -3682,17 +3697,10 @@ class HermesCLI:
             if self.gateway_session_mode:
                 from hermes_cli.gateway_session_client import (
                     GatewaySessionAgentProxy,
-                    check_gateway_session_endpoint,
-                    resolve_gateway_session_endpoint,
+                    ensure_gateway_session_bridge,
                 )
 
-                endpoint = resolve_gateway_session_endpoint()
-                if not check_gateway_session_endpoint(endpoint):
-                    ChatConsole().print(
-                        "[bold red]Gateway session mode requires a running local gateway API server.[/]\n"
-                        "Start it with [bold]hermes gateway run[/] (or restart the gateway service)."
-                    )
-                    return False
+                endpoint = ensure_gateway_session_bridge()
 
                 self.agent = GatewaySessionAgentProxy(
                     endpoint=endpoint,
@@ -9305,6 +9313,9 @@ class HermesCLI:
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
+            if result and result.get("detached"):
+                return None
+
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
@@ -10125,6 +10136,11 @@ class HermesCLI:
                 return
 
             if self._agent_running and self.agent:
+                if self._detach_gateway_session_and_exit(
+                    event,
+                    message="⚡ Detaching from gateway-hosted session...",
+                ):
+                    return
                 if now - self._last_ctrl_c_time < 2.0:
                     print("\n⚡ Force exiting...")
                     self._should_exit = True
@@ -10148,6 +10164,11 @@ class HermesCLI:
         @kb.add('c-d')
         def handle_ctrl_d(event):
             """Handle Ctrl+D - exit."""
+            if self._detach_gateway_session_and_exit(
+                event,
+                message="⚡ Detaching from gateway-hosted session...",
+            ):
+                return
             self._should_exit = True
             event.app.exit()
 
@@ -11348,6 +11369,7 @@ def main(
 
     gateway_session_mode = (
         not query
+        and sys.stdin.isatty()
         and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
         not in {"0", "false", "no", "off"}
     )

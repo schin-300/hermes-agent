@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 from hermes_cli.gateway_session_client import (
     GatewaySessionAgentProxy,
@@ -26,6 +28,18 @@ class _FakeResponse:
 
     def close(self):
         self.closed = True
+
+
+class _BlockingResponse(_FakeResponse):
+    def __init__(self, payload=None, status_code=200):
+        super().__init__(payload=payload, lines=[], status_code=status_code)
+        self._started = threading.Event()
+
+    def iter_lines(self, decode_unicode=True):
+        self._started.set()
+        while not self.closed:
+            time.sleep(0.01)
+        return
 
 
 class _FakeSession:
@@ -121,3 +135,35 @@ def test_interrupt_posts_run_cancel_and_closes_stream():
     assert fake_stream.closed is True
     assert fake_session.calls[-1][0] == "POST"
     assert fake_session.calls[-1][1].endswith("/v1/runs/run_123/cancel")
+
+
+def test_detach_closes_stream_without_cancelling_run():
+    fake_stream = _BlockingResponse()
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_123", "status": "started"}),
+        event_response=fake_stream,
+    )
+    proxy = GatewaySessionAgentProxy(
+        endpoint=GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+    result_box = {}
+
+    def _run():
+        result_box["result"] = proxy.run_conversation(
+            user_message="Hello",
+            conversation_history=[],
+        )
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    fake_stream._started.wait(timeout=1)
+
+    proxy.detach()
+    thread.join(timeout=2)
+
+    assert thread.is_alive() is False
+    assert fake_stream.closed is True
+    assert result_box["result"]["detached"] is True
+    assert not any(call[1].endswith("/cancel") for call in fake_session.calls)

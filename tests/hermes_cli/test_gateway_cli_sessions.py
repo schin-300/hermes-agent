@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.gateway_session_client import GatewaySessionEndpoint
+from hermes_cli.gateway_session_client import (
+    GatewaySessionClientError,
+    GatewaySessionEndpoint,
+)
 from hermes_cli.main import cmd_chat
 
 
@@ -31,14 +34,11 @@ def _args(**overrides):
 def test_cmd_chat_interactive_uses_gateway_without_local_provider(monkeypatch):
     captured = {}
 
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: False)
     monkeypatch.setattr(
-        "hermes_cli.gateway_session_client.resolve_gateway_session_endpoint",
-        lambda: GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.gateway_session_client.check_gateway_session_endpoint",
-        lambda endpoint: True,
+        "hermes_cli.gateway_session_client.ensure_gateway_session_bridge",
+        lambda timeout=15.0, autostart=True: GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
     )
     import cli as cli_module
 
@@ -55,14 +55,11 @@ def test_cmd_chat_interactive_uses_gateway_without_local_provider(monkeypatch):
 
 
 def test_cmd_chat_interactive_exits_when_gateway_unavailable(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
     monkeypatch.setattr(
-        "hermes_cli.gateway_session_client.resolve_gateway_session_endpoint",
-        lambda: GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.gateway_session_client.check_gateway_session_endpoint",
-        lambda endpoint: False,
+        "hermes_cli.gateway_session_client.ensure_gateway_session_bridge",
+        lambda timeout=15.0, autostart=True: (_ for _ in ()).throw(GatewaySessionClientError("bridge down")),
     )
 
     with pytest.raises(SystemExit) as exc:
