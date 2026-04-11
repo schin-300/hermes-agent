@@ -235,6 +235,16 @@ class HostedSessionAgentProxy:
         except Exception:
             logger.debug("Hosted tool progress callback failed", exc_info=True)
 
+    @staticmethod
+    def _normalize_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+        """Accept both canonical nested payload events and older flattened events."""
+        nested = event.get("payload")
+        payload = dict(nested) if isinstance(nested, dict) else {}
+        for key in ("delta", "content", "text", "tool", "preview", "args", "duration", "error", "output", "usage"):
+            if key not in payload and key in event:
+                payload[key] = event.get(key)
+        return payload
+
     def run_conversation(
         self,
         *,
@@ -289,7 +299,7 @@ class HostedSessionAgentProxy:
                     continue
                 event = json.loads(payload_text)
                 event_type = str(event.get("event") or "")
-                payload = event.get("payload") or {}
+                payload = self._normalize_event_payload(event)
 
                 if event_type == "message.delta":
                     delta = str(payload.get("delta") or "")
@@ -300,7 +310,7 @@ class HostedSessionAgentProxy:
                             response_previewed = True
                 elif event_type == "message.completed":
                     final_response = str(payload.get("content") or final_response or "")
-                elif event_type in {"reasoning.delta", "reasoning.completed"}:
+                elif event_type in {"reasoning.delta", "reasoning.completed", "reasoning.available"}:
                     reasoning_text = str(payload.get("text") or "")
                     if reasoning_text:
                         final_reasoning = reasoning_text

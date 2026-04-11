@@ -96,6 +96,49 @@ def test_hosted_session_proxy_maps_canonical_events_to_cli_callbacks():
     assert any(args[0] == "subagent.progress" for args, _ in tool_events)
 
 
+def test_hosted_session_proxy_accepts_flattened_legacy_event_shape():
+    streamed = []
+    reasoning = []
+    tool_events = []
+
+    events = [
+        'data: ' + json.dumps({"event": "tool.started", "tool": "read_file", "preview": "README.md", "args": {"path": "README.md"}}),
+        'data: ' + json.dumps({"event": "message.delta", "delta": "Hello"}),
+        'data: ' + json.dumps({"event": "reasoning.available", "text": "Thinking"}),
+        'data: ' + json.dumps({"event": "tool.completed", "tool": "read_file", "duration": 0.1, "error": False}),
+        'data: ' + json.dumps({"event": "run.completed", "output": "Hello!", "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}}),
+        ': stream closed',
+    ]
+
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_legacy", "session_id": "sess_legacy", "status": "started"}),
+        event_response=_FakeResponse(lines=events),
+    )
+
+    proxy = HostedSessionAgentProxy(
+        endpoint=HostedSessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_legacy",
+        tool_progress_callback=lambda *args, **kwargs: tool_events.append((args, kwargs)),
+        reasoning_callback=lambda text: reasoning.append(text),
+        http_session=fake_session,
+    )
+
+    result = proxy.run_conversation(
+        user_message="legacy",
+        conversation_history=[],
+        stream_callback=lambda delta: streamed.append(delta),
+    )
+
+    assert streamed == ["Hello"]
+    assert reasoning == ["Thinking"]
+    assert result["final_response"] == "Hello!"
+    assert result["last_reasoning"] == "Thinking"
+    assert result["response_previewed"] is True
+    assert proxy.session_total_tokens == 5
+    assert any(args[0] == "tool.started" for args, _ in tool_events)
+    assert any(args[0] == "tool.completed" for args, _ in tool_events)
+
+
 def test_hosted_session_proxy_interrupt_posts_cancel_and_close_session_posts_close():
     fake_session = _FakeSession(
         run_response=_FakeResponse({"run_id": "run_1", "session_id": "sess_1", "status": "started"}),

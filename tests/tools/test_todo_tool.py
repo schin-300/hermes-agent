@@ -24,7 +24,7 @@ class TestWriteAndRead:
         items[0]["content"] = "MUTATED"
         assert store.read()[0]["content"] == "Task"
 
-    def test_preserves_review_loop_metadata(self):
+    def test_coerces_review_loop_items_back_to_plain_tasks(self):
         store = TodoStore()
         store.write([
             {
@@ -38,9 +38,9 @@ class TestWriteAndRead:
             }
         ])
         item = store.read()[0]
-        assert item["kind"] == "review_loop"
-        assert item["success_criteria"] == "Popup persists edits."
-        assert item["reviewer_profile"] == "gpt-5.4 reviewer"
+        assert item["kind"] == "task"
+        assert "success_criteria" not in item
+        assert "reviewer_profile" not in item
         assert item["attempt_count"] == 2
 
 
@@ -83,9 +83,9 @@ class TestFormatForInjection:
         assert "[>]" in text
         assert "Next" in text
         assert "Working" in text
-        assert "review_loop" in text
-        assert "criteria: Popup passes review" in text
-        assert "reviewer: gpt-5.4 reviewer" in text
+        assert "review_loop" not in text
+        assert "criteria:" not in text
+        assert "reviewer:" not in text
         assert "context compression" in text.lower()
 
 

@@ -99,16 +99,17 @@ class TestCliBusySlashCommands:
         assert _drain_queue(cli_obj._pending_input) == []
         assert _drain_queue(cli_obj._interrupt_queue) == []
 
-    def test_submit_busy_input_preserves_non_command_interrupt_behavior(self):
+    def test_submit_busy_input_stages_non_command_at_tool_boundary_in_interrupt_mode(self):
         cli_obj = _make_cli()
 
         with patch("cli._cprint"):
             result = cli_obj._submit_busy_input("please stop and do this instead")
 
-        assert result == "interrupt"
+        assert result == "tool_boundary"
         assert _drain_queue(cli_obj._busy_command_queue) == []
         assert _drain_queue(cli_obj._pending_input) == []
-        assert _drain_queue(cli_obj._interrupt_queue) == ["please stop and do this instead"]
+        assert _drain_queue(cli_obj._interrupt_queue) == []
+        assert _drain_queue(cli_obj._tool_boundary_input_queue) == ["please stop and do this instead"]
 
     def test_submit_busy_input_defers_live_command_when_active_thread_has_already_finished(self):
         cli_obj = _make_cli()
@@ -143,10 +144,35 @@ class TestCliBusySlashCommands:
         assert cli_obj._should_exit is False
         assert any("boom" in str(call.args[0]) for call in mock_cprint.call_args_list)
 
-    def test_agent_busy_placeholder_mentions_queue_command(self):
+    def test_agent_busy_placeholder_mentions_second_enter_interrupt_hint(self):
         cli_obj = _make_cli()
 
-        assert "/q to queue message" in cli_obj._agent_busy_placeholder_text()
+        placeholder = cli_obj._agent_busy_placeholder_text()
+
+        assert "send after next tool call" in placeholder
+        assert "Enter again interrupts" in placeholder
+
+    def test_agent_busy_placeholder_mentions_queued_followup_state(self):
+        cli_obj = _make_cli()
+        cli_obj._queue_after_current_tool_boundary("follow up")
+
+        placeholder = cli_obj._agent_busy_placeholder_text()
+
+        assert "queued after next tool call" in placeholder
+        assert "Enter again interrupts now" in placeholder
+
+    def test_interrupt_staged_busy_followup_promotes_to_interrupt(self):
+        cli_obj = _make_cli()
+        cli_obj.agent = MagicMock()
+        cli_obj.agent._interrupt_requested = False
+        cli_obj._tool_boundary_input_queue.put("follow up")
+
+        with patch("cli._cprint"):
+            promoted = cli_obj._interrupt_staged_busy_followup()
+
+        assert promoted is True
+        cli_obj.agent.interrupt.assert_called_once_with("follow up")
+        assert _drain_queue(cli_obj._tool_boundary_input_queue) == []
 
     def test_queue_command_while_busy_stages_tool_boundary_input(self):
         cli_obj = _make_cli()
@@ -160,7 +186,7 @@ class TestCliBusySlashCommands:
         assert _drain_queue(cli_obj._tool_boundary_input_queue) == ["follow up"]
         assert _drain_queue(cli_obj._pending_input) == []
 
-    def test_on_tool_complete_promotes_queued_followup_to_interrupt(self):
+    def test_on_tool_complete_keeps_queued_followup_staged(self):
         cli_obj = _make_cli()
         cli_obj.agent = MagicMock()
         cli_obj.agent._interrupt_requested = False
@@ -170,8 +196,8 @@ class TestCliBusySlashCommands:
 
         cli_obj._on_tool_complete("call_1", "terminal", {"command": "echo hi"}, "ok")
 
-        cli_obj.agent.interrupt.assert_called_once_with("follow up")
-        assert _drain_queue(cli_obj._tool_boundary_input_queue) == []
+        cli_obj.agent.interrupt.assert_not_called()
+        assert _drain_queue(cli_obj._tool_boundary_input_queue) == ["follow up"]
 
     def test_flush_tool_boundary_queue_to_pending_preserves_followups(self):
         cli_obj = _make_cli()

@@ -721,7 +721,7 @@ class TestHydrateTodoStore:
         with patch("run_agent._set_interrupt"):
             agent._hydrate_todo_store(history)
         assert agent._todo_store.has_items()
-        assert agent._todo_store.read()[0]["kind"] == "review_loop"
+        assert agent._todo_store.read()[0]["kind"] == "task"
 
     def test_skips_non_todo_tools(self, agent):
         history = [

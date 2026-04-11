@@ -43,7 +43,7 @@ class TestCLITodoPlanWidget:
         assert cli_obj._build_todo_plan_lines(width=100) == []
         assert cli_obj._get_todo_plan_height() == 0
 
-    def test_build_todo_plan_lines_show_block_kinds(self):
+    def test_build_todo_plan_lines_stay_high_level(self):
         cli_obj = _attach_todos(
             _make_cli(),
             [
@@ -63,10 +63,12 @@ class TestCLITodoPlanWidget:
         texts = [text for _style, text in lines]
 
         assert texts[0] == "• Updated Plan"
-        assert any("[task] Ship popup" in text for text in texts)
-        assert any("[review-loop] Review popup against expected behavior" in text for text in texts)
+        assert any("Ship popup" in text for text in texts)
+        assert any("Review popup against expected behavior" in text for text in texts)
+        assert not any("[task]" in text for text in texts)
+        assert not any("[review-loop]" in text for text in texts)
 
-    def test_build_plan_popup_lines_show_selected_review_loop_details(self):
+    def test_build_plan_popup_lines_skip_review_metadata(self):
         cli_obj = _attach_todos(
             _make_cli(),
             [
@@ -87,9 +89,9 @@ class TestCLITodoPlanWidget:
         texts = [text for _style, text in lines]
 
         assert texts[0].startswith("↑/↓ select")
-        assert any("❯ ☐ [review-loop] Review popup against expected behavior" in text for text in texts)
-        assert any("Expected: Popup edits persist" in text for text in texts)
-        assert any("Reviewer: gpt-5.4 reviewer" in text for text in texts)
+        assert any("❯ ☐ Review popup against expected behavior" in text for text in texts)
+        assert not any("Expected:" in text for text in texts)
+        assert not any("Reviewer:" in text for text in texts)
 
     def test_plan_popup_commit_entry_adds_task_and_snapshot_message(self):
         cli_obj = _attach_todos(_make_cli(), [])
@@ -106,7 +108,7 @@ class TestCLITodoPlanWidget:
         assert cli_obj.conversation_history[-1]["content"].startswith(TODO_SNAPSHOT_MARKER)
         assert cli_obj._plan_popup_state["mode"] == "browse"
 
-    def test_plan_popup_commit_entry_adds_review_loop_defaults(self):
+    def test_plan_popup_commit_entry_ignores_removed_review_mode(self):
         cli_obj = _attach_todos(_make_cli(), [])
         cli_obj._plan_popup_state = {"selected": 0, "mode": "add_review"}
 
@@ -114,14 +116,8 @@ class TestCLITodoPlanWidget:
             "Review containerized result | Tests pass in the container and expected files exist | Compare requested result to delivered work"
         )
 
-        assert committed is True
-        items = cli_obj._get_todo_items()
-        assert len(items) == 1
-        item = items[0]
-        assert item["kind"] == "review_loop"
-        assert item["success_criteria"] == "Tests pass in the container and expected files exist"
-        assert item["reviewer_profile"] == "gpt-5.4 reviewer"
-        assert item["reviewer_prompt"] == "Compare requested result to delivered work"
+        assert committed is False
+        assert cli_obj._get_todo_items() == []
 
     def test_plan_popup_set_selected_status_keeps_single_in_progress(self):
         cli_obj = _attach_todos(

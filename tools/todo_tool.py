@@ -20,7 +20,7 @@ from typing import Dict, Any, List, Optional
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
-VALID_KINDS = {"task", "review_loop"}
+VALID_KINDS = {"task"}
 
 # Marker used when the operator updates the plan board directly from the CLI.
 # Stored as a normal user message so it survives resume/hydration without
@@ -121,24 +121,10 @@ class TodoStore:
         if not active_items:
             return None
 
-        lines = [
-            "[Your active task list was preserved across context compression]",
-            "Treat review_loop items as blocking: do not finish until their success criteria have been independently reviewed.",
-        ]
+        lines = ["[Your active task list was preserved across context compression]"]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
-            kind = item.get("kind", "task")
-            suffix_parts = [item["status"]]
-            if kind != "task":
-                suffix_parts.append(kind)
-            criteria = str(item.get("success_criteria") or "").strip()
-            if criteria:
-                suffix_parts.append(f"criteria: {criteria}")
-            reviewer = str(item.get("reviewer_profile") or "").strip()
-            if reviewer:
-                suffix_parts.append(f"reviewer: {reviewer}")
-            suffix = "; ".join(suffix_parts)
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({suffix})")
+            lines.append(f"- {marker} {item['content']}")
 
         return "\n".join(lines)
 
@@ -173,11 +159,7 @@ class TodoStore:
             "kind": kind,
         }
 
-        optional_text_fields = (
-            "success_criteria",
-            "reviewer_profile",
-            "reviewer_prompt",
-        )
+        optional_text_fields = ()
         for key in optional_text_fields:
             value = str(item.get(key, "") or "").strip()
             if value:

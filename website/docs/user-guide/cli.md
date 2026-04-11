@@ -208,7 +208,7 @@ Pasting multi-line text is supported — use `Alt+Enter` or `Ctrl+J` to insert n
 
 You can interrupt the agent at any point:
 
-- **Type a new message + Enter** while the agent is working — it interrupts and processes your new instructions
+- **Type a new message + Enter** while the agent is working — in the default mode it queues your follow-up for the next tool/safe boundary; press Enter again to interrupt immediately with that queued follow-up
 - **`Ctrl+C`** — interrupt the current operation (press twice within 2s to force exit)
 - In-progress terminal commands are killed immediately (SIGTERM, then SIGKILL after 1s)
 - Multiple messages typed during interrupt are combined into one prompt
@@ -219,7 +219,7 @@ The `display.busy_input_mode` config key controls what happens when you press En
 
 | Mode | Behavior |
 |------|----------|
-| `"interrupt"` (default) | Your message interrupts the current operation and is processed immediately |
+| `"interrupt"` (default) | First Enter stages your follow-up for the next tool/safe boundary; pressing Enter again interrupts immediately with that queued follow-up |
 | `"queue"` | Your message is silently queued and sent as the next turn after the agent finishes |
 
 ```yaml

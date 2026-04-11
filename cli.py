@@ -8432,7 +8432,9 @@ class HermesCLI:
                 logger.debug("Todo plan widget update failed", exc_info=True)
             self._invalidate(min_interval=0)
 
-        self._promote_tool_boundary_input_to_interrupt()
+        # Do not auto-interrupt when a queued follow-up is waiting for the next
+        # tool boundary.  Keep it staged so the current turn can finish unless
+        # the operator presses Enter again to interrupt explicitly.
 
     # ====================================================================
     # Voice mode methods

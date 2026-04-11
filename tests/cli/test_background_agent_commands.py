@@ -168,6 +168,35 @@ def test_hermes_addition_creates_worktree_and_injects_pr_workflow(cli_instance):
     assert MockAgent.call_args.kwargs["clarify_callback"] == "CALLBACK"
 
 
+def test_hermes_addition_targets_hermes_checkout_when_active_cwd_is_not_a_repo(cli_instance):
+    cli_instance._build_hermes_addition_prompt = HermesCLI._build_hermes_addition_prompt.__get__(cli_instance, HermesCLI)
+
+    with patch("cli._git_repo_root", return_value=None), \
+         patch("cli._current_hermes_checkout_root", return_value="/repo", create=True), \
+         patch("cli._setup_worktree", return_value={
+            "path": "/repo/.worktrees/hermes-1234",
+            "branch": "hermes/hermes-1234",
+            "repo_root": "/repo",
+         }) as mock_setup, \
+         patch("cli._git_remote_exists", return_value=True), \
+         patch("cli._git_default_base_ref", return_value="origin/main"), \
+         patch("cli.threading.Thread", _ImmediateThread), \
+         patch("cli.AIAgent") as MockAgent, \
+         patch("cli.ChatConsole") as MockChatConsole:
+        MockAgent.return_value.run_conversation.return_value = {"final_response": ""}
+        MockChatConsole.return_value.print = MagicMock()
+
+        HermesCLI._handle_hermes_addition_command(cli_instance, "/hermes-addition Fix the flaky retry path")
+
+    mock_setup.assert_called_once_with(repo_root="/repo")
+    user_message = MockAgent.return_value.run_conversation.call_args.kwargs["user_message"]
+    assert "/repo/.worktrees/hermes-1234" in user_message
+    assert "hermes/hermes-1234" in user_message
+    assert "gh pr create" in user_message
+    assert "fork" in user_message
+    assert MockAgent.call_args.kwargs["clarify_callback"] == "CALLBACK"
+
+
 def test_fix_a_fork_targets_hermes_checkout_and_separates_fork_push_from_upstream_pr(cli_instance):
     cli_instance._build_fix_a_fork_prompt = HermesCLI._build_fix_a_fork_prompt.__get__(cli_instance, HermesCLI)
 
