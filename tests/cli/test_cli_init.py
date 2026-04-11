@@ -163,6 +163,53 @@ class TestToolProgressRendering:
         ]
 
 
+class TestSessionSwitcher:
+    def test_list_switchable_sessions_marks_current_session(self):
+        cli = _make_cli()
+        cli.session_id = "current"
+        cli._session_db = MagicMock()
+        cli._session_db.list_sessions_rich.return_value = [
+            {"id": "current", "title": "Current title", "preview": "", "source": "api_server"},
+            {"id": "other", "title": "Other title", "preview": "", "source": "api_server"},
+        ]
+
+        sessions = cli._list_switchable_sessions(limit=50)
+
+        assert sessions[0]["title"].startswith("● ")
+        assert sessions[1]["title"] == "Other title"
+
+    def test_browse_and_swap_session_uses_picker_and_resume(self):
+        cli = _make_cli()
+        cli._agent_running = False
+        cli._session_db = MagicMock()
+        cli._session_db.list_sessions_rich.return_value = [
+            {"id": "current", "title": "Current title", "preview": "", "source": "api_server"},
+            {"id": "other", "title": "Other title", "preview": "", "source": "api_server"},
+        ]
+        cli._handle_resume_command = MagicMock()
+
+        with patch("hermes_cli.main._session_browse_picker", return_value="other"):
+            assert cli._browse_and_swap_session() is True
+
+        cli._handle_resume_command.assert_called_once_with("/resume other")
+
+    def test_browse_and_swap_session_requires_idle_agent(self):
+        cli = _make_cli()
+        cli._agent_running = True
+        cli._session_db = MagicMock()
+        cli._session_db.list_sessions_rich.return_value = [{"id": "other", "title": "Other", "preview": "", "source": "api_server"}]
+        printed = []
+        globals_dict = cli._browse_and_swap_session.__globals__
+        original_cprint = globals_dict["_cprint"]
+        globals_dict["_cprint"] = printed.append
+        try:
+            assert cli._browse_and_swap_session() is False
+        finally:
+            globals_dict["_cprint"] = original_cprint
+
+        assert any("Interrupt current work first" in msg for msg in printed)
+
+
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):
         cli = _make_cli()

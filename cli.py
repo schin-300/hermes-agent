@@ -5210,6 +5210,47 @@ class HermesCLI:
         print()
         return True
 
+    def _list_switchable_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return sessions suitable for barebones Ctrl+B session switching."""
+        if not self._session_db:
+            return []
+        try:
+            sessions = self._session_db.list_sessions_rich(
+                exclude_sources=["tool"],
+                limit=limit,
+            )
+        except Exception:
+            return []
+        annotated = []
+        for session in sessions:
+            if not isinstance(session, dict) or not session.get("id"):
+                continue
+            row = dict(session)
+            if row["id"] == self.session_id:
+                title = (row.get("title") or row.get("preview") or row["id"]).strip()
+                row["title"] = f"● {title}" if title else f"● {row['id']}"
+            annotated.append(row)
+        return annotated
+
+    def _browse_and_swap_session(self) -> bool:
+        """Open the curses session picker and switch this CLI to the selected session."""
+        if self._agent_running:
+            _cprint("  Interrupt current work first, then Ctrl+B to switch sessions.")
+            return False
+        sessions = self._list_switchable_sessions(limit=50)
+        if not sessions:
+            _cprint("  No sessions available to switch.")
+            return False
+        from hermes_cli.main import _session_browse_picker
+        selected_id = _session_browse_picker(sessions)
+        if not selected_id:
+            return False
+        if selected_id == self.session_id:
+            _cprint("  Already on that session.")
+            return False
+        self._handle_resume_command(f"/resume {selected_id}")
+        return True
+
     def show_history(self):
         """Display conversation history."""
         if not self.conversation_history:
@@ -10295,6 +10336,24 @@ class HermesCLI:
         except Exception:
             _voice_key = "c-b"
 
+        def _launch_session_switcher(event):
+            """Barebones Ctrl+B session switcher when voice mode is off."""
+            if cli_ref._clarify_state or cli_ref._sudo_state or cli_ref._approval_state or cli_ref._secret_state:
+                return
+            from prompt_toolkit.application import run_in_terminal
+
+            async def _browse_and_swap():
+                selected = {"switched": False}
+
+                def _run_picker():
+                    selected["switched"] = cli_ref._browse_and_swap_session()
+
+                await run_in_terminal(_run_picker)
+                if selected["switched"] and hasattr(cli_ref, '_app') and cli_ref._app:
+                    cli_ref._app.invalidate()
+
+            event.app.create_background_task(_browse_and_swap())
+
         @kb.add(_voice_key)
         def handle_voice_record(event):
             """Toggle voice recording when voice mode is active.
@@ -10304,6 +10363,8 @@ class HermesCLI:
             entire UI.  All heavy work is dispatched to daemon threads.
             """
             if not cli_ref._voice_mode:
+                if _voice_key == 'c-b':
+                    _launch_session_switcher(event)
                 return
             # Always allow STOPPING a recording (even when agent is running)
             if cli_ref._voice_recording:
@@ -10354,6 +10415,13 @@ class HermesCLI:
 
                 threading.Thread(target=_start_recording, daemon=True).start()
                 event.app.invalidate()
+
+        if _voice_key != 'c-b':
+            @kb.add('c-b')
+            def handle_ctrl_b_session_browser(event):
+                if cli_ref._voice_recording or cli_ref._voice_processing:
+                    return
+                _launch_session_switcher(event)
         from prompt_toolkit.keys import Keys
 
         @kb.add(Keys.BracketedPaste, eager=True)
