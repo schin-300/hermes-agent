@@ -852,6 +852,58 @@ class TestAuxiliaryPoolAwareness:
         assert client is not None
         assert provider == "custom:local"
 
+    def test_vision_auto_uses_auth_store_active_provider_when_config_missing(self, monkeypatch):
+        """Vision auto should consult auth.json active_provider when config.yaml has no provider."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+             patch("agent.auxiliary_client._read_main_model", return_value="gpt-5-codex"), \
+             patch("hermes_cli.auth.get_active_provider", return_value="openai-codex"), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(MagicMock(), "gpt-5-codex")) as mock_resolve:
+            provider, client, model = resolve_vision_provider_client()
+        assert client is not None
+        assert provider == "openai-codex"
+        mock_resolve.assert_called_once_with("openai-codex", "gpt-5-codex")
+
+    def test_vision_direct_endpoint_override(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        monkeypatch.setenv("AUXILIARY_VISION_BASE_URL", "http://localhost:4567/v1")
+        monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "vision-key")
+        monkeypatch.setenv("AUXILIARY_VISION_MODEL", "vision-model")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = get_vision_auxiliary_client()
+        assert model == "vision-model"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://localhost:4567/v1"
+        assert mock_openai.call_args.kwargs["api_key"] == "vision-key"
+
+    def test_vision_direct_endpoint_without_key_uses_placeholder(self, monkeypatch):
+        """Vision endpoint without API key should use 'no-key-required' placeholder."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        monkeypatch.setenv("AUXILIARY_VISION_BASE_URL", "http://localhost:4567/v1")
+        monkeypatch.setenv("AUXILIARY_VISION_MODEL", "vision-model")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = get_vision_auxiliary_client()
+        assert client is not None
+        assert model == "vision-model"
+        assert mock_openai.call_args.kwargs["api_key"] == "no-key-required"
+
+    def test_vision_uses_openrouter_when_available(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = get_vision_auxiliary_client()
+        assert model == "google/gemini-3-flash-preview"
+        assert client is not None
+
+    def test_vision_uses_nous_when_available(self, monkeypatch):
+        with patch("agent.auxiliary_client._read_nous_auth") as mock_nous, \
+             patch("agent.auxiliary_client.OpenAI"):
+            mock_nous.return_value = {"access_token": "***"}
+            client, model = get_vision_auxiliary_client()
+        assert model == "google/gemini-3-flash-preview"
+        assert client is not None
+
     def test_vision_config_google_provider_uses_gemini_credentials(self, monkeypatch):
         config = {
             "auxiliary": {
