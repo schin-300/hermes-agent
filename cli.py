@@ -3043,7 +3043,7 @@ class HermesCLI:
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                     ("class:status-bar", " "),
-                ]
+                ])
             else:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
@@ -3053,7 +3053,7 @@ class HermesCLI:
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
-                    ])
+                    ]
                     if background_label:
                         frags.extend([
                             ("class:status-bar-dim", " · "),
@@ -3063,7 +3063,7 @@ class HermesCLI:
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
@@ -3082,7 +3082,7 @@ class HermesCLI:
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
-                    ])
+                    ]
                     if background_label:
                         frags.extend([
                             ("class:status-bar-dim", " │ "),
@@ -3092,7 +3092,7 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
