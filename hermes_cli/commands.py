@@ -94,6 +94,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--global]"),
+    CommandDef("context-limit", "Set or toggle the current session context window", "Configuration",
+               cli_only=True, args_hint="[tokens]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
 
