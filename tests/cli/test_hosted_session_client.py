@@ -139,6 +139,28 @@ def test_hosted_session_proxy_accepts_flattened_legacy_event_shape():
     assert any(args[0] == "tool.completed" for args, _ in tool_events)
 
 
+def test_hosted_session_proxy_plain_interrupt_does_not_create_redirect_message():
+    events = [
+        'data: ' + json.dumps({"event": "run.cancelled", "payload": {"error": "Interrupted"}}),
+        ': stream closed',
+    ]
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_plain_interrupt", "session_id": "sess_1", "status": "started"}),
+        event_response=_FakeResponse(lines=events),
+    )
+    proxy = HostedSessionAgentProxy(
+        endpoint=HostedSessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+    proxy._active_run_id = "run_plain_interrupt"
+    proxy.interrupt()
+    result = proxy.run_conversation(user_message="ignored", conversation_history=[])
+    assert result.get("interrupted") is True
+    assert result.get("interrupt_message") is None
+    assert result.get("error") == "Interrupted"
+
+
 def test_hosted_session_proxy_interrupt_posts_cancel_and_close_session_posts_close():
     fake_session = _FakeSession(
         run_response=_FakeResponse({"run_id": "run_1", "session_id": "sess_1", "status": "started"}),

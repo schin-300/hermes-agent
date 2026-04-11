@@ -335,7 +335,10 @@ class HostedSessionAgentProxy:
                     error_message = str(payload.get("error") or "Hosted run failed")
                 elif event_type == "run.cancelled":
                     interrupted = True
-                    error_message = self._interrupt_message or str(payload.get("error") or "Interrupted")
+                    if self._interrupt_message is not None:
+                        error_message = self._interrupt_message
+                    else:
+                        error_message = str(payload.get("error") or "Interrupted")
 
             if not final_response:
                 final_response = "".join(streamed_chunks)
@@ -382,14 +385,14 @@ class HostedSessionAgentProxy:
             result["last_reasoning"] = final_reasoning
         if error_message:
             result["error"] = error_message
-        if interrupted:
-            result["interrupt_message"] = error_message
+        if interrupted and self._interrupt_message is not None:
+            result["interrupt_message"] = self._interrupt_message
         return result
 
     def interrupt(self, message: Optional[str] = None) -> None:
         with self._active_lock:
             self._interrupt_requested = True
-            self._interrupt_message = message or "Interrupted"
+            self._interrupt_message = message
             run_id = self._active_run_id
             response = self._active_events_response
 
