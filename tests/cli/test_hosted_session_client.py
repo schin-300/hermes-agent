@@ -27,18 +27,23 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, run_response, event_response):
+    def __init__(self, run_response, event_response, live_sessions_response=None):
         self.run_response = run_response
         self.event_response = event_response
+        self.live_sessions_response = live_sessions_response or _FakeResponse({"sessions": []})
         self.posts = []
         self.gets = []
 
     def post(self, url, json=None, headers=None, timeout=None):
         self.posts.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        if url.endswith("/attach") or url.endswith("/detach") or url.endswith("/close") or url.endswith("/cancel"):
+            return _FakeResponse({"ok": True})
         return self.run_response
 
-    def get(self, url, headers=None, stream=False, timeout=None):
-        self.gets.append({"url": url, "headers": headers, "stream": stream, "timeout": timeout})
+    def get(self, url, headers=None, stream=False, timeout=None, params=None):
+        self.gets.append({"url": url, "headers": headers, "stream": stream, "timeout": timeout, "params": params})
+        if url.endswith("/v1/sessions/live"):
+            return self.live_sessions_response
         return self.event_response
 
 
@@ -177,3 +182,33 @@ def test_hosted_session_proxy_interrupt_posts_cancel_and_close_session_posts_clo
 
     proxy.close_session()
     assert fake_session.posts[-1]["url"].endswith("/v1/sessions/sess_1/close")
+
+
+def test_hosted_session_proxy_registers_live_session_and_can_switch_between_live_sessions():
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_1", "session_id": "sess_1", "status": "started"}),
+        event_response=_FakeResponse(lines=[]),
+        live_sessions_response=_FakeResponse({
+            "sessions": [
+                {"id": "sess_1", "title": "Current", "preview": "", "source": "live", "last_active": 10},
+                {"id": "sess_2", "title": "Other", "preview": "", "source": "live", "last_active": 9},
+            ]
+        }),
+    )
+    proxy = HostedSessionAgentProxy(
+        endpoint=HostedSessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+
+    assert fake_session.posts[0]["url"].endswith("/v1/sessions/sess_1/attach")
+    assert fake_session.posts[0]["json"]["client_id"] == proxy.client_id
+
+    rows = proxy.list_live_sessions(limit=25)
+    assert [row["id"] for row in rows] == ["sess_1", "sess_2"]
+    assert fake_session.gets[-1]["params"] == {"limit": 25}
+
+    proxy.switch_session("sess_2")
+    assert proxy.session_id == "sess_2"
+    assert fake_session.posts[-2]["url"].endswith("/v1/sessions/sess_1/detach")
+    assert fake_session.posts[-1]["url"].endswith("/v1/sessions/sess_2/attach")

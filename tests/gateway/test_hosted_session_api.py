@@ -21,6 +21,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/cancel", adapter._handle_cancel_run)
+    app.router.add_get("/v1/sessions/live", adapter._handle_live_sessions)
+    app.router.add_post("/v1/sessions/{session_id}/attach", adapter._handle_attach_session)
+    app.router.add_post("/v1/sessions/{session_id}/detach", adapter._handle_detach_session)
     app.router.add_post("/v1/sessions/{session_id}/close", adapter._handle_close_session)
     return app
 
@@ -156,3 +159,31 @@ async def test_close_session_endpoint_returns_404_for_missing_session():
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post("/v1/sessions/missing/close")
         assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_live_session_endpoints_track_attached_gateway_clients():
+    adapter = _make_adapter()
+    app = _create_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        attach = await cli.post(
+            "/v1/sessions/sess_live/attach",
+            json={"client_id": "cli_1", "model": "gpt-test", "provider": "openai"},
+        )
+        assert attach.status == 200
+        attach_payload = await attach.json()
+        assert attach_payload["session"]["id"] == "sess_live"
+        assert attach_payload["session"]["attached_clients"] == 1
+
+        live = await cli.get("/v1/sessions/live")
+        assert live.status == 200
+        rows = (await live.json())["sessions"]
+        assert [row["id"] for row in rows] == ["sess_live"]
+        assert rows[0]["status"] == "attached"
+
+        detach = await cli.post("/v1/sessions/sess_live/detach", json={"client_id": "cli_1"})
+        assert detach.status == 200
+
+        live_after = await cli.get("/v1/sessions/live")
+        assert (await live_after.json())["sessions"] == []

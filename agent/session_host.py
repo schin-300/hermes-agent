@@ -47,6 +47,9 @@ class HostedSession:
     conversation_history: list[dict[str, Any]] = field(default_factory=list)
     active_run_id: Optional[str] = None
     closed: bool = False
+    attachments: dict[str, dict[str, Any]] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    last_active_at: float = field(default_factory=time.time)
 
 
 class _AgentRef(list):
@@ -81,6 +84,111 @@ class SessionHost:
         with self._lock:
             return self._runs.get(run_id)
 
+    @staticmethod
+    def _clean_session_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+        clean: dict[str, Any] = {}
+        for key, value in dict(metadata or {}).items():
+            if value in (None, ""):
+                continue
+            clean[str(key)] = value
+        return clean
+
+    @staticmethod
+    def _message_preview(content: Any) -> str:
+        if isinstance(content, str):
+            return " ".join(content.strip().split())
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+            return " ".join(" ".join(text_parts).split())
+        return " ".join(str(content or "").strip().split())
+
+    def _session_summary_locked(self, session: HostedSession) -> dict[str, Any]:
+        active_run = self._runs.get(session.active_run_id) if session.active_run_id else None
+        run_is_live = bool(active_run is not None and not active_run.finished)
+        preview = ""
+        for message in reversed(session.conversation_history):
+            if not isinstance(message, dict):
+                continue
+            preview = self._message_preview(message.get("content"))
+            if preview:
+                break
+        title = str(session.metadata.get("title") or session.metadata.get("label") or "").strip() or None
+        return {
+            "id": session.session_id,
+            "title": title,
+            "preview": preview,
+            "source": "live",
+            "last_active": session.last_active_at,
+            "status": "running" if run_is_live else ("attached" if session.attachments else "idle"),
+            "active_run_id": session.active_run_id if run_is_live else None,
+            "attached_clients": len(session.attachments),
+            "model": session.metadata.get("model"),
+            "provider": session.metadata.get("provider"),
+        }
+
+    def attach_session(
+        self,
+        session_id: str,
+        *,
+        client_id: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        clean_meta = self._clean_session_metadata(metadata)
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                session = HostedSession(session_id=session_id)
+                self._sessions[session_id] = session
+            session.closed = False
+            session.metadata.update(clean_meta)
+            existing = dict(session.attachments.get(client_id, {}))
+            session.attachments[client_id] = {
+                "client_id": client_id,
+                "attached_at": existing.get("attached_at", now),
+                "last_seen_at": now,
+                **clean_meta,
+            }
+            session.last_active_at = now
+            return self._session_summary_locked(session)
+
+    def detach_session(self, session_id: str, *, client_id: str) -> bool:
+        now = time.time()
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.attachments.pop(client_id, None)
+            session.last_active_at = now
+        return True
+
+    def list_sessions(self, *, live_only: bool = False, limit: Optional[int] = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows: list[dict[str, Any]] = []
+            for session in self._sessions.values():
+                summary = self._session_summary_locked(session)
+                is_live = bool(summary.get("active_run_id") or summary.get("attached_clients"))
+                if session.closed and not is_live:
+                    continue
+                if live_only and not is_live:
+                    continue
+                rows.append(summary)
+
+        status_rank = {"running": 0, "attached": 1, "idle": 2}
+        rows.sort(key=lambda row: (status_rank.get(str(row.get("status") or "idle"), 99), -(float(row.get("last_active") or 0.0))))
+        if limit is not None:
+            try:
+                limit = max(int(limit), 0)
+            except (TypeError, ValueError):
+                limit = 0
+            rows = rows[:limit]
+        return rows
+
     def active_run_count(self) -> int:
         with self._lock:
             return sum(1 for run in self._runs.values() if not run.finished)
@@ -101,6 +209,8 @@ class SessionHost:
             if session is None:
                 return False
             session.closed = True
+            session.attachments.clear()
+            session.last_active_at = time.time()
             active_run_id = session.active_run_id
         if active_run_id:
             self.cancel_run(active_run_id, reason="Session closed")
@@ -161,6 +271,8 @@ class SessionHost:
                 session = HostedSession(session_id=session_id)
                 self._sessions[session_id] = session
                 created_session = True
+            if session_meta:
+                session.metadata.update(self._clean_session_metadata(session_meta))
             if session.active_run_id:
                 active = self._runs.get(session.active_run_id)
                 if active is not None and not active.finished:
@@ -168,6 +280,7 @@ class SessionHost:
             if conversation_history is not None:
                 session.conversation_history = [msg for msg in conversation_history if isinstance(msg, dict)]
             session.closed = False
+            session.last_active_at = time.time()
             resolved_run_id = run_id or f"run_{uuid.uuid4().hex}"
             run = HostedRun(run_id=resolved_run_id, session_id=session_id)
             self._runs[resolved_run_id] = run
@@ -460,6 +573,9 @@ class SessionHost:
             if run is None:
                 return
             run.events.append(event)
+            session = self._sessions.get(run.session_id)
+            if session is not None:
+                session.last_active_at = float(event.timestamp)
             subscribers = list(run.subscribers)
         event_payload = event.to_dict()
         for subscriber in subscribers:
@@ -478,6 +594,7 @@ class SessionHost:
             session = self._sessions.get(run.session_id)
             if session is not None and session.active_run_id == run_id:
                 session.active_run_id = None
+                session.last_active_at = time.time()
         for subscriber in subscribers:
             try:
                 subscriber.loop.call_soon_threadsafe(subscriber.queue.put_nowait, None)

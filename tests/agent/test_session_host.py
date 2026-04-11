@@ -101,3 +101,24 @@ async def test_session_host_emits_subagent_progress():
     assert len(subagent_events) == 1
     assert subagent_events[0]["payload"]["tool"] == "delegate_task"
     assert subagent_events[0]["payload"]["text"] == "child 1/2"
+
+
+def test_session_host_lists_live_attached_sessions_and_hides_detached_ones():
+    host = SessionHost()
+
+    attached = host.attach_session(
+        "sess_live",
+        client_id="cli_1",
+        metadata={"title": "Live Session", "model": "gpt-test", "provider": "openai"},
+    )
+
+    assert attached["id"] == "sess_live"
+    assert attached["status"] == "attached"
+    assert attached["attached_clients"] == 1
+
+    rows = host.list_sessions(live_only=True)
+    assert [row["id"] for row in rows] == ["sess_live"]
+    assert rows[0]["title"] == "Live Session"
+
+    assert host.detach_session("sess_live", client_id="cli_1") is True
+    assert host.list_sessions(live_only=True) == []

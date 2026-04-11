@@ -5212,15 +5212,29 @@ class HermesCLI:
 
     def _list_switchable_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return sessions suitable for barebones Ctrl+B session switching."""
-        if not self._session_db:
-            return []
-        try:
-            sessions = self._session_db.list_sessions_rich(
-                exclude_sources=["tool"],
-                limit=limit,
-            )
-        except Exception:
-            return []
+        gateway_mode = getattr(self, "gateway_session_mode", False)
+        sessions: list[dict[str, Any]] = []
+        if gateway_mode:
+            if self.agent is None:
+                try:
+                    self._init_agent()
+                except Exception:
+                    pass
+            live_provider = getattr(self.agent, "list_live_sessions", None) if self.agent else None
+            if callable(live_provider):
+                try:
+                    sessions = live_provider(limit=limit) or []
+                except Exception:
+                    sessions = []
+        elif self._session_db:
+            try:
+                sessions = self._session_db.list_sessions_rich(
+                    exclude_sources=["tool"],
+                    limit=limit,
+                )
+            except Exception:
+                sessions = []
+
         annotated = []
         for session in sessions:
             if not isinstance(session, dict) or not session.get("id"):
@@ -5234,12 +5248,16 @@ class HermesCLI:
 
     def _browse_and_swap_session(self) -> bool:
         """Open the curses session picker and switch this CLI to the selected session."""
+        gateway_mode = getattr(self, "gateway_session_mode", False)
         if self._agent_running:
             _cprint("  Interrupt current work first, then Ctrl+B to switch sessions.")
             return False
         sessions = self._list_switchable_sessions(limit=50)
         if not sessions:
-            _cprint("  No sessions available to switch.")
+            if gateway_mode:
+                _cprint("  No live gateway sessions available to switch.")
+            else:
+                _cprint("  No sessions available to switch.")
             return False
         from hermes_cli.main import _session_browse_picker
         selected_id = _session_browse_picker(sessions)
@@ -5363,7 +5381,10 @@ class HermesCLI:
         self.context_length_override = None
 
         if self.agent:
-            self.agent.session_id = self.session_id
+            if hasattr(self.agent, "switch_session"):
+                self.agent.switch_session(self.session_id)
+            else:
+                self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             if hasattr(self.agent, "set_context_length_override"):
                 self.agent.set_context_length_override(None)
@@ -5418,7 +5439,35 @@ class HermesCLI:
         resolved = _resolve_session_by_name_or_id(target)
         target_id = resolved or target
 
+        gateway_mode = getattr(self, "gateway_session_mode", False)
+        if gateway_mode and self.agent is None:
+            try:
+                self._init_agent()
+            except Exception:
+                pass
+
         session_meta = self._session_db.get_session(target_id)
+        if not session_meta and gateway_mode and self.agent and hasattr(self.agent, "list_live_sessions"):
+            try:
+                live_sessions = self.agent.list_live_sessions(limit=200)
+            except Exception:
+                live_sessions = []
+            live_match = next((row for row in live_sessions if isinstance(row, dict) and row.get("id") == target_id), None)
+            if live_match:
+                try:
+                    self._session_db.ensure_session(
+                        target_id,
+                        source=str(live_match.get("source") or "api_server"),
+                        model=live_match.get("model") or self.model,
+                    )
+                    self._session_db.reopen_session(target_id)
+                except Exception:
+                    pass
+                session_meta = self._session_db.get_session(target_id) or {
+                    "id": target_id,
+                    "title": live_match.get("title"),
+                    "source": live_match.get("source") or "api_server",
+                }
         if not session_meta:
             _cprint(f"  Session not found: {target}")
             _cprint("  Use /history or `hermes sessions list` to see available sessions.")
@@ -5456,7 +5505,10 @@ class HermesCLI:
 
         # Sync the agent if already initialised
         if self.agent:
-            self.agent.session_id = target_id
+            if hasattr(self.agent, "switch_session"):
+                self.agent.switch_session(target_id)
+            else:
+                self.agent.session_id = target_id
             if hasattr(self.agent, "set_context_length_override"):
                 self.agent.set_context_length_override(None)
             self.agent.reset_session_state()
@@ -5583,7 +5635,10 @@ class HermesCLI:
 
         # Sync the agent
         if self.agent:
-            self.agent.session_id = new_session_id
+            if hasattr(self.agent, "switch_session"):
+                self.agent.switch_session(new_session_id)
+            else:
+                self.agent.session_id = new_session_id
             self.agent.session_start = now
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
@@ -11424,6 +11479,11 @@ class HermesCLI:
                     self._persist_active_session_on_exit()
                 except (Exception, KeyboardInterrupt) as e:
                     logger.debug("Could not backfill active session state on exit: %s", e)
+                if getattr(self, "gateway_session_mode", False) and hasattr(self.agent, "detach_session"):
+                    try:
+                        self.agent.detach_session()
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug("Could not detach hosted session on exit: %s", e)
                 try:
                     self._session_db.end_session(self.agent.session_id, "cli_close")
                 except (Exception, KeyboardInterrupt) as e:

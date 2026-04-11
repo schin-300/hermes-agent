@@ -1707,6 +1707,59 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
         return web.json_response({"ok": True, "run_id": run_id})
 
+    async def _handle_live_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/live — list live hosted sessions currently attached to the gateway."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        raw_limit = request.query.get("limit")
+        limit = None
+        if raw_limit not in (None, ""):
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return web.json_response(_openai_error("'limit' must be an integer"), status=400)
+        sessions = self._session_host.list_sessions(live_only=True, limit=limit)
+        return web.json_response({"sessions": sessions})
+
+    async def _handle_attach_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/attach — register a live client attachment for a hosted session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        client_id = str((body or {}).get("client_id") or "").strip()
+        if not client_id:
+            return web.json_response(_openai_error("Missing 'client_id' field"), status=400)
+        metadata = {
+            key: value
+            for key, value in (body or {}).items()
+            if key not in {"client_id"}
+        }
+        summary = self._session_host.attach_session(session_id, client_id=client_id, metadata=metadata)
+        return web.json_response({"ok": True, "session": summary})
+
+    async def _handle_detach_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/detach — unregister a live client attachment for a hosted session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        client_id = str((body or {}).get("client_id") or "").strip()
+        if not client_id:
+            return web.json_response(_openai_error("Missing 'client_id' field"), status=400)
+        if not self._session_host.detach_session(session_id, client_id=client_id):
+            return web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+        return web.json_response({"ok": True, "session_id": session_id, "client_id": client_id})
+
     async def _handle_close_session(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/close — close a hosted session."""
         auth_err = self._check_auth(request)
@@ -1759,6 +1812,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
+            self._app.router.add_get("/v1/sessions/live", self._handle_live_sessions)
+            self._app.router.add_post("/v1/sessions/{session_id}/attach", self._handle_attach_session)
+            self._app.router.add_post("/v1/sessions/{session_id}/detach", self._handle_detach_session)
             self._app.router.add_post("/v1/sessions/{session_id}/close", self._handle_close_session)
             # Start background sweep to clean up old finished runs
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

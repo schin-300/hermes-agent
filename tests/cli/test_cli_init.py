@@ -178,6 +178,23 @@ class TestSessionSwitcher:
         assert sessions[0]["title"].startswith("● ")
         assert sessions[1]["title"] == "Other title"
 
+    def test_list_switchable_sessions_uses_live_gateway_sessions_when_hosted(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli.session_id = "current"
+        cli.agent = MagicMock()
+        cli.agent.list_live_sessions.return_value = [
+            {"id": "current", "title": "Current live", "preview": "", "source": "live"},
+            {"id": "other", "title": "Other live", "preview": "", "source": "live"},
+        ]
+        cli._session_db = MagicMock()
+
+        sessions = cli._list_switchable_sessions(limit=25)
+
+        cli.agent.list_live_sessions.assert_called_once_with(limit=25)
+        cli._session_db.list_sessions_rich.assert_not_called()
+        assert sessions[0]["title"].startswith("● ")
+        assert sessions[1]["title"] == "Other live"
+
     def test_browse_and_swap_session_uses_picker_and_resume(self):
         cli = _make_cli()
         cli._agent_running = False
@@ -355,6 +372,26 @@ class TestHistoryDisplay:
         assert "Recent sessions" in output
         assert "Checking Running Hermes Agent" in output
         assert "Use /resume <session id or title> to continue" in output
+
+    def test_resume_can_materialize_live_gateway_session_missing_from_db(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli.session_id = "current"
+        cli._session_db = MagicMock()
+        cli._session_db.get_session.side_effect = [
+            None,
+            {"id": "live_other", "title": None, "source": "live"},
+        ]
+        cli._session_db.get_messages_as_conversation.return_value = []
+        cli.agent = MagicMock()
+        cli.agent.list_live_sessions.return_value = [
+            {"id": "live_other", "title": "Other live", "source": "live", "model": "gpt-test"},
+        ]
+
+        with patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="live_other"):
+            cli._handle_resume_command("/resume live_other")
+
+        cli._session_db.ensure_session.assert_called_once_with("live_other", source="live", model="gpt-test")
+        cli.agent.switch_session.assert_called_once_with("live_other")
 
 
 class TestRootLevelProviderOverride:

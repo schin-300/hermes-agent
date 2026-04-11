@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -156,12 +157,16 @@ class HostedSessionAgentProxy:
         self._last_flushed_db_idx = 0
         self.tools: list[Any] = []
         self.valid_tool_names: set[str] = set()
+        self.client_id = f"cli_{uuid.uuid4().hex}"
+        self._attached = False
 
         self.session_cache_write_tokens = 0
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
         self.session_total_tokens = 0
         self.session_api_calls = 0
+
+        self.attach_session()
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -194,6 +199,60 @@ class HostedSessionAgentProxy:
             "context_length_override": self.context_length_override,
         }
         return {k: v for k, v in payload.items() if v not in (None, "", [])}
+
+    def _session_registration_payload(self) -> dict[str, Any]:
+        payload = {
+            "client_id": self.client_id,
+            "client_kind": "cli",
+            "model": self.model,
+            "provider": self.provider,
+        }
+        return {k: v for k, v in payload.items() if v not in (None, "", [])}
+
+    def attach_session(self) -> None:
+        response = self.http_session.post(
+            f"{self.endpoint.base_url}/v1/sessions/{self.session_id}/attach",
+            json=self._session_registration_payload(),
+            headers=self._headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        self._attached = True
+
+    def detach_session(self) -> None:
+        if not self._attached:
+            return
+        response = self.http_session.post(
+            f"{self.endpoint.base_url}/v1/sessions/{self.session_id}/detach",
+            json={"client_id": self.client_id},
+            headers=self._headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        self._attached = False
+
+    def list_live_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        response = self.http_session.get(
+            f"{self.endpoint.base_url}/v1/sessions/live",
+            headers=self._headers(),
+            timeout=10,
+            params={"limit": limit},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("sessions") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return []
+        return [dict(row) for row in rows if isinstance(row, dict) and row.get("id")]
+
+    def switch_session(self, new_session_id: str) -> None:
+        target_id = str(new_session_id or "").strip()
+        if not target_id or target_id == self.session_id:
+            return
+        if self._attached:
+            self.detach_session()
+        self.session_id = target_id
+        self.attach_session()
 
     def _start_run(self, *, user_message: str, conversation_history: list[dict[str, str]]) -> tuple[str, str]:
         payload: dict[str, Any] = {
@@ -256,6 +315,8 @@ class HostedSessionAgentProxy:
         **_: Any,
     ) -> dict[str, Any]:
         del task_id
+        if not self._attached:
+            self.attach_session()
         normalized_history = self._normalized_history(conversation_history)
         visible_user_message = message_content_to_text(
             persist_user_message if persist_user_message is not None else user_message
@@ -422,6 +483,7 @@ class HostedSessionAgentProxy:
             timeout=10,
         )
         response.raise_for_status()
+        self._attached = False
 
     def switch_model(
         self,
