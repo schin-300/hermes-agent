@@ -5,6 +5,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+from agent.display import get_tool_emoji
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -121,6 +123,44 @@ class TestGatewayHostedMode:
 
         assert cli.agent is fake_proxy
         mock_proxy.assert_called_once()
+
+
+class TestToolProgressRendering:
+    def test_tool_progress_new_mode_prints_new_tools_once(self):
+        cli = _make_cli(config_overrides={"display": {"tool_progress": "new"}})
+        printed = []
+        cli._invalidate = lambda *args, **kwargs: None
+        globals_dict = cli._on_tool_progress.__globals__
+        original_cprint = globals_dict["_cprint"]
+        globals_dict["_cprint"] = printed.append
+        try:
+            cli._on_tool_progress("tool.started", "read_file", "README.md", {"path": "README.md"})
+            cli._on_tool_progress("tool.started", "read_file", "README.md", {"path": "README.md"})
+            cli._on_tool_progress("tool.completed", "read_file", None, None, duration=0.2, is_error=False)
+        finally:
+            globals_dict["_cprint"] = original_cprint
+
+        assert printed == [f"  ┊ {get_tool_emoji('read_file')} README.md"]
+
+    def test_tool_progress_all_mode_prints_completion_and_subagent_updates(self):
+        cli = _make_cli(config_overrides={"display": {"tool_progress": "all"}})
+        printed = []
+        cli._invalidate = lambda *args, **kwargs: None
+        globals_dict = cli._on_tool_progress.__globals__
+        original_cprint = globals_dict["_cprint"]
+        globals_dict["_cprint"] = printed.append
+        try:
+            cli._on_tool_progress("tool.started", "write_file", "notes.txt", {"path": "notes.txt"})
+            cli._on_tool_progress("subagent.progress", "delegate_task", "child 1/2")
+            cli._on_tool_progress("tool.completed", "write_file", None, None, duration=0.2, is_error=False)
+        finally:
+            globals_dict["_cprint"] = original_cprint
+
+        assert printed == [
+            f"  ┊ {get_tool_emoji('write_file')} notes.txt",
+            "  ┊ 🤖 child 1/2",
+            "  ┊ ✅ write_file (0.2s)",
+        ]
 
 
 class TestBusyInputMode:

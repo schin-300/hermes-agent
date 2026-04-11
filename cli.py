@@ -1947,6 +1947,7 @@ class HermesCLI:
         self._secret_deadline = 0
         self._spinner_text: str = ""  # thinking spinner text for TUI
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
+        self._seen_tool_progress_keys: set[str] = set()
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -8323,31 +8324,60 @@ class HermesCLI:
 
         Updates the TUI spinner widget so the user can see what the agent
         is doing during tool execution (fills the gap between thinking
-        spinner and next response).  Also plays audio cue in voice mode.
+        spinner and next response).  Also emits one-line progress items so
+        hosted sessions preserve the familiar CLI tool feed.
 
         On tool.started, records a monotonic timestamp so get_spinner_text()
         can show a live elapsed timer (the TUI poll loop already invalidates
         every ~0.15s, so the counter updates automatically).
         """
+        mode = str(getattr(self, "tool_progress_mode", "all") or "all").lower()
+        if mode not in {"off", "new", "all", "verbose"}:
+            mode = "all"
+
+        def _emit_progress_line(text: str, *, key: str | None = None) -> None:
+            if mode == "off" or not text:
+                return
+            if mode == "new" and key:
+                if key in self._seen_tool_progress_keys:
+                    return
+                self._seen_tool_progress_keys.add(key)
+            _cprint(text)
+
         if event_type == "tool.completed":
-            import time as _time
             self._tool_start_time = 0.0
             self._invalidate()
+            if function_name and not function_name.startswith("_") and mode in {"all", "verbose"}:
+                status = "❌" if kwargs.get("is_error", False) else "✅"
+                duration = kwargs.get("duration")
+                suffix = f" ({float(duration):.1f}s)" if duration not in (None, "") else ""
+                _emit_progress_line(f"  ┊ {status} {function_name}{suffix}")
             return
+
+        if event_type == "subagent.progress":
+            if mode in {"all", "verbose"}:
+                label = preview or function_name or "subagent"
+                _emit_progress_line(f"  ┊ 🤖 {label}")
+            return
+
         if event_type != "tool.started":
             return
         if function_name and not function_name.startswith("_"):
             import time as _time
-            from agent.display import get_tool_emoji
+            from agent.display import get_tool_emoji, get_tool_preview_max_len
+
             emoji = get_tool_emoji(function_name)
             label = preview or function_name
-            from agent.display import get_tool_preview_max_len
             _pl = get_tool_preview_max_len()
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
             self._tool_start_time = _time.monotonic()
             self._invalidate()
+            _emit_progress_line(
+                f"  ┊ {emoji} {label}",
+                key=f"{function_name}:{label}" if label else function_name,
+            )
 
         if not self._voice_mode:
             return
@@ -9223,6 +9253,7 @@ class HermesCLI:
             # across intermediate turn boundaries (tool-calling loops) — only
             # reset at the start of each user turn.
             self._reasoning_shown_this_turn = False
+            self._seen_tool_progress_keys.clear()
 
             # --- Streaming TTS setup ---
             # When ElevenLabs is the TTS provider and sounddevice is available,
