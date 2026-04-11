@@ -96,6 +96,33 @@ class TestVerboseAndToolProgress:
         assert cli.tool_progress_mode in ("off", "new", "all", "verbose")
 
 
+class TestGatewayHostedMode:
+    def test_gateway_session_mode_flag_is_stored(self):
+        cli = _make_cli(gateway_session_mode=True)
+        assert cli.gateway_session_mode is True
+
+    def test_init_agent_uses_hosted_proxy_when_gateway_session_mode_enabled(self):
+        from types import SimpleNamespace
+
+        cli = _make_cli(gateway_session_mode=True)
+
+        fake_endpoint = SimpleNamespace(base_url="http://127.0.0.1:8642", api_key=None)
+        fake_proxy = SimpleNamespace(
+            session_id=cli.session_id,
+            model=cli.model,
+            context_compressor=SimpleNamespace(context_length=None),
+            verbose_logging=False,
+            quiet_mode=True,
+        )
+
+        with patch("hermes_cli.hosted_session_client.ensure_hosted_session_bridge", return_value=fake_endpoint), \
+             patch("hermes_cli.hosted_session_client.HostedSessionAgentProxy", return_value=fake_proxy) as mock_proxy:
+            assert cli._init_agent() is True
+
+        assert cli.agent is fake_proxy
+        mock_proxy.assert_called_once()
+
+
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):
         cli = _make_cli()
@@ -110,11 +137,11 @@ class TestBusyInputMode:
         assert cli.busy_input_mode == "interrupt"
 
     def test_queue_command_works_while_busy(self):
-        """When agent is running, /queue should still put the prompt in _pending_input."""
+        """When agent is running, /queue should stage the prompt for the next tool boundary."""
         cli = _make_cli()
         cli._agent_running = True
         cli.process_command("/queue follow up")
-        assert cli._pending_input.get_nowait() == "follow up"
+        assert cli._tool_boundary_input_queue.get_nowait() == "follow up"
 
     def test_queue_command_works_while_idle(self):
         """When agent is idle, /queue should still queue (not reject)."""
@@ -136,16 +163,13 @@ class TestBusyInputMode:
         assert cli._pending_input.get_nowait() == "follow up"
         assert cli._interrupt_queue.empty()
 
-    def test_interrupt_mode_routes_busy_enter_to_interrupt(self):
-        """In interrupt mode (default), Enter while busy goes to _interrupt_queue."""
+    def test_interrupt_mode_routes_busy_enter_to_tool_boundary_queue(self):
+        """In interrupt mode (default), the first busy Enter stages a follow-up at the next tool boundary."""
         cli = _make_cli()
         cli._agent_running = True
-        text = "redirect"
-        if cli.busy_input_mode == "queue":
-            cli._pending_input.put(text)
-        else:
-            cli._interrupt_queue.put(text)
-        assert cli._interrupt_queue.get_nowait() == "redirect"
+        cli._submit_busy_input("redirect")
+        assert cli._tool_boundary_input_queue.get_nowait() == "redirect"
+        assert cli._interrupt_queue.empty()
         assert cli._pending_input.empty()
 
 

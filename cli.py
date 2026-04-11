@@ -1707,6 +1707,7 @@ class HermesCLI:
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        gateway_session_mode: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -1726,6 +1727,7 @@ class HermesCLI:
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        self.gateway_session_mode = bool(gateway_session_mode)
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -1737,7 +1739,9 @@ class HermesCLI:
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
-        # busy_input_mode: "interrupt" (Enter interrupts current run) or "queue" (Enter queues for next turn)
+        # busy_input_mode: "interrupt" (Enter stages a follow-up at the next
+        # tool/safe boundary; Enter again interrupts with it) or "queue"
+        # (Enter queues for the next turn)
         _bim = CLI_CONFIG["display"].get("busy_input_mode", "interrupt")
         self.busy_input_mode = "queue" if str(_bim).strip().lower() == "queue" else "interrupt"
 
@@ -2361,6 +2365,12 @@ class HermesCLI:
     def _queue_after_current_tool_boundary(self, payload) -> int:
         boundary_queue = self._ensure_tool_boundary_input_queue()
         boundary_queue.put(payload)
+        return self._tool_boundary_queue_size()
+
+    def _tool_boundary_queue_size(self) -> int:
+        boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
+        if boundary_queue is None:
+            return 0
         try:
             return boundary_queue.qsize()
         except Exception:
@@ -2410,9 +2420,33 @@ class HermesCLI:
             return False
 
     def _agent_busy_placeholder_text(self) -> str:
+        queued_followups = self._tool_boundary_queue_size()
         if getattr(self, 'busy_input_mode', 'interrupt') == 'queue':
+            if queued_followups > 0:
+                followup_label = "follow-up" if queued_followups == 1 else f"{queued_followups} follow-ups"
+                return f"{followup_label} queued after next tool call, Enter queues another, Ctrl+C to cancel"
             return "type a message + Enter to queue next turn, /q after tool, Ctrl+C to cancel"
-        return "type a message + Enter to interrupt, /q to queue message, Ctrl+C to cancel"
+        if queued_followups > 0:
+            followup_label = "follow-up" if queued_followups == 1 else f"{queued_followups} follow-ups"
+            return f"{followup_label} queued after next tool call, Enter again interrupts now, Ctrl+C to cancel"
+        return "type a message + Enter to send after next tool call, Enter again interrupts, Ctrl+C to cancel"
+
+    def _interrupt_staged_busy_followup(self) -> bool:
+        if getattr(self, 'busy_input_mode', 'interrupt') == 'queue':
+            return False
+        queued_followups = self._tool_boundary_queue_size()
+        if queued_followups <= 0:
+            return False
+
+        promoted = self._promote_tool_boundary_input_to_interrupt()
+        if promoted:
+            remaining = self._tool_boundary_queue_size()
+            if remaining > 0:
+                _cprint(f"  Interrupting now with queued follow-up ({remaining} more still queued)")
+            else:
+                _cprint("  Interrupting now with queued follow-up")
+            self._invalidate(min_interval=0)
+        return promoted
 
     def _submit_busy_input(self, payload) -> str:
         """Route user input submitted while the agent is already generating."""
@@ -2445,17 +2479,21 @@ class HermesCLI:
             _cprint(f"  Queued for the next turn: {preview_short}")
             return "queue"
 
-        self._interrupt_queue.put(payload)
-        # Debug: log to file when message enters interrupt queue
-        try:
-            _dbg = _hermes_home / "interrupt_debug.log"
-            with open(_dbg, "a") as _f:
-                import time as _t
-                _f.write(f"{_t.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
-                         f"agent_running={self._agent_running}\n")
-        except Exception:
-            pass
-        return "interrupt"
+        self._queue_after_current_tool_boundary(payload)
+        agent = getattr(self, "agent", None)
+        tool_active = bool(
+            agent
+            and (
+                getattr(agent, "_executing_tools", False)
+                or getattr(agent, "_current_tool", None)
+            )
+        )
+        if tool_active:
+            _cprint(f"  Queued after the current tool call: {preview_short}")
+        else:
+            _cprint(f"  Queued for the next safe boundary: {preview_short}")
+        _cprint(f"  {_DIM}Press Enter again to interrupt now.{_RST}")
+        return "tool_boundary"
 
     def _process_live_busy_commands(self, *, max_commands: Optional[int] = 8) -> None:
         """Run any live-safe slash commands queued while the agent is busy."""
@@ -2625,9 +2663,8 @@ class HermesCLI:
                 status = str(item.get("status") or "pending")
                 marker = self._todo_status_marker(item)
                 style = styles.get(status, "plan-pending")
-                kind_label = self._todo_kind_label(item)
                 content = str(item.get("content") or item.get("id") or "(no description)").strip()
-                row = f"[{kind_label}] {content}"
+                row = content
                 for wrapped in self._wrap_display_text(
                     row,
                     content_width,
@@ -2687,9 +2724,8 @@ class HermesCLI:
 
         mode = state.get("mode", "browse")
         hint = {
-            "browse": "↑/↓ select · a add task · r add review loop · space done · i active · esc close",
+            "browse": "↑/↓ select · a add task · space done · i active · esc close",
             "add_task": "Add task — type the row text below and press Enter",
-            "add_review": "Add review loop — title | success criteria | reviewer note(optional)",
         }.get(mode, "esc close")
         for wrapped in self._wrap_display_text(hint, content_width, initial_indent="", subsequent_indent="  "):
             lines.append(("plan-popup-meta", wrapped))
@@ -2705,20 +2741,10 @@ class HermesCLI:
         for absolute_idx, item in enumerate(visible, start=window_start):
             prefix = "❯ " if absolute_idx == selected else "  "
             marker = self._todo_status_marker(item)
-            row = f"{prefix}{marker} [{self._todo_kind_label(item)}] {str(item.get('content') or item.get('id') or '(no description)').strip()}"
+            row = f"{prefix}{marker} {str(item.get('content') or item.get('id') or '(no description)').strip()}"
             style = "plan-popup-selected" if absolute_idx == selected else "plan-popup-text"
             for wrapped in self._wrap_display_text(row, content_width, initial_indent="", subsequent_indent="   "):
                 lines.append((style, wrapped))
-
-        item = items[selected]
-        criteria = str(item.get("success_criteria") or "").strip()
-        reviewer = str(item.get("reviewer_profile") or "").strip()
-        if criteria:
-            for wrapped in self._wrap_display_text(f"Expected: {criteria}", content_width, initial_indent="", subsequent_indent="  "):
-                lines.append(("plan-popup-meta", wrapped))
-        if reviewer:
-            for wrapped in self._wrap_display_text(f"Reviewer: {reviewer}", content_width, initial_indent="", subsequent_indent="  "):
-                lines.append(("plan-popup-meta", wrapped))
         return lines
 
     def _build_plan_snapshot_message(self, items: list[Dict[str, str]]) -> Optional[str]:
@@ -2975,32 +3001,16 @@ class HermesCLI:
         state = self._ensure_plan_popup_state()
         mode = state.get("mode", "browse")
         text = str(raw_text or "").strip()
-        if mode not in {"add_task", "add_review"} or not text:
+        if mode != "add_task" or not text:
             return False
 
         items = self._get_todo_items()
-        if mode == "add_review":
-            parts = [part.strip() for part in text.split("|")]
-            title = parts[0] if parts else text
-            criteria = parts[1] if len(parts) > 1 and parts[1] else "Delivered work matches the requested behavior and passes an independent review."
-            reviewer_note = parts[2] if len(parts) > 2 and parts[2] else ""
-            item = {
-                "id": self._slugify_todo_id(title, prefix="review"),
-                "content": title or "Review loop",
-                "status": "pending",
-                "kind": "review_loop",
-                "success_criteria": criteria,
-                "reviewer_profile": "gpt-5.4 reviewer",
-            }
-            if reviewer_note:
-                item["reviewer_prompt"] = reviewer_note
-        else:
-            item = {
-                "id": self._slugify_todo_id(text, prefix="task"),
-                "content": text,
-                "status": "pending",
-                "kind": "task",
-            }
+        item = {
+            "id": self._slugify_todo_id(text, prefix="task"),
+            "content": text,
+            "status": "pending",
+            "kind": "task",
+        }
 
         updated = list(items) + [item]
         self._rewrite_plan_items(updated)
@@ -3757,7 +3767,7 @@ class HermesCLI:
         if self.agent is not None:
             return True
 
-        if not self._ensure_runtime_credentials():
+        if (not self.gateway_session_mode) and (not self._ensure_runtime_credentials()):
             return False
 
         # Initialize SQLite session store for CLI sessions (if not already done in __init__)
@@ -3820,63 +3830,90 @@ class HermesCLI:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
-            self.agent = AIAgent(
-                model=effective_model,
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"),
-                credential_pool=runtime.get("credential_pool"),
-                max_iterations=self.max_turns,
-                enabled_toolsets=self.enabled_toolsets,
-                verbose_logging=self.verbose,
-                quiet_mode=not self.verbose,
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
-                service_tier=self.service_tier,
-                request_overrides=request_overrides,
-                extra_body_config=self.extra_body_config,
-                providers_allowed=self._providers_only,
-                providers_ignored=self._providers_ignore,
-                providers_order=self._providers_order,
-                provider_sort=self._provider_sort,
-                provider_require_parameters=self._provider_require_params,
-                provider_data_collection=self._provider_data_collection,
-                session_id=self.session_id,
-                platform="cli",
-                session_db=self._session_db,
-                clarify_callback=self._clarify_callback,
-                reasoning_callback=self._current_reasoning_callback(),
+            if self.gateway_session_mode:
+                from hermes_cli.hosted_session_client import (
+                    HostedSessionAgentProxy,
+                    ensure_hosted_session_bridge,
+                )
 
-                fallback_model=self._fallback_model,
-                context_length_override=self.context_length_override,
-                thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
-                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                pass_session_id=self.pass_session_id,
-                tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-            )
-            try:
-                local_store = getattr(self, "_local_todo_store", None)
-                if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
-                    seed_items = local_store.read()
-                    if seed_items and not self.agent._todo_store.has_items():
-                        self.agent._todo_store.write(seed_items, merge=False)
-            except Exception:
-                pass
-            # Store reference for atexit memory provider shutdown
-            global _active_agent_ref
-            _active_agent_ref = self.agent
-            # Route agent status output through prompt_toolkit so ANSI escape
-            # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
-            self.agent._print_fn = _cprint
+                endpoint = ensure_hosted_session_bridge()
+                self.agent = HostedSessionAgentProxy(
+                    endpoint=endpoint,
+                    session_id=self.session_id,
+                    model=effective_model,
+                    provider=runtime.get("provider"),
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    api_mode=runtime.get("api_mode"),
+                    enabled_toolsets=self.enabled_toolsets,
+                    service_tier=self.service_tier,
+                    context_length_override=self.context_length_override,
+                    compression_threshold=getattr(self, "context_compaction_threshold", 0.5),
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    tool_progress_callback=self._on_tool_progress,
+                    reasoning_callback=self._current_reasoning_callback(),
+                    tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+                )
+            else:
+                self.agent = AIAgent(
+                    model=effective_model,
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    provider=runtime.get("provider"),
+                    api_mode=runtime.get("api_mode"),
+                    acp_command=runtime.get("command"),
+                    acp_args=runtime.get("args"),
+                    credential_pool=runtime.get("credential_pool"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    prefill_messages=self.prefill_messages or None,
+                    reasoning_config=self.reasoning_config,
+                    service_tier=self.service_tier,
+                    request_overrides=request_overrides,
+                    extra_body_config=self.extra_body_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    session_id=self.session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    clarify_callback=self._clarify_callback,
+                    reasoning_callback=self._current_reasoning_callback(),
+
+                    fallback_model=self._fallback_model,
+                    context_length_override=self.context_length_override,
+                    thinking_callback=self._on_thinking,
+                    checkpoints_enabled=self.checkpoints_enabled,
+                    checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+                    pass_session_id=self.pass_session_id,
+                    tool_progress_callback=self._on_tool_progress,
+                    tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
+                    tool_complete_callback=self._on_tool_complete,
+                    stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                    tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+                )
+                try:
+                    local_store = getattr(self, "_local_todo_store", None)
+                    if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
+                        seed_items = local_store.read()
+                        if seed_items and not self.agent._todo_store.has_items():
+                            self.agent._todo_store.write(seed_items, merge=False)
+                except Exception:
+                    pass
+                # Store reference for atexit memory provider shutdown
+                global _active_agent_ref
+                _active_agent_ref = self.agent
+                # Route agent status output through prompt_toolkit so ANSI escape
+                # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
+                self.agent._print_fn = _cprint
             self._active_agent_route_signature = (
                 effective_model,
                 runtime.get("provider"),
@@ -5840,9 +5877,9 @@ class HermesCLI:
             return
 
         prompt = parts[1].strip()
-        repo_root = _git_repo_root()
+        repo_root = _current_hermes_checkout_root() or _git_repo_root()
         if not repo_root:
-            _cprint("  /hermes-addition requires a git repo in the active terminal cwd.")
+            _cprint("  /hermes-addition could not resolve the main Hermes checkout.")
             return
 
         worktree_info = _setup_worktree(repo_root=repo_root)
@@ -9945,8 +9982,8 @@ class HermesCLI:
                     event.app.invalidate()
                 return
 
-            # --- Plan popup entry mode: add a task or review loop block ---
-            if self._plan_popup_state and self._plan_popup_state.get("mode") in {"add_task", "add_review"}:
+            # --- Plan popup entry mode: add a task ---
+            if self._plan_popup_state and self._plan_popup_state.get("mode") == "add_task":
                 text = event.app.current_buffer.text.strip()
                 if self._plan_popup_commit_entry(text):
                     event.app.current_buffer.reset(append_to_history=False)
@@ -9956,6 +9993,11 @@ class HermesCLI:
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
+            if self._agent_running and not (text or has_images):
+                if self._interrupt_staged_busy_followup():
+                    event.app.current_buffer.reset(append_to_history=False)
+                    event.app.invalidate()
+                return
             if text or has_images:
                 # Snapshot and clear attached images
                 images = list(self._attached_images)
@@ -10012,14 +10054,6 @@ class HermesCLI:
                 # No menu and no suggestion — start completions from scratch
                 buf.start_completion()
 
-        @kb.add('c-p')
-        def toggle_plan_popup(event):
-            """Toggle the interactive plan-board popup."""
-            if self._sudo_state or self._secret_state or self._approval_state or self._clarify_state:
-                return
-            self._toggle_plan_popup()
-            event.app.invalidate()
-
         _plan_popup_browse = Condition(lambda: bool(self._plan_popup_state) and self._plan_popup_state.get("mode") == "browse")
 
         @kb.add('up', filter=_plan_popup_browse)
@@ -10037,11 +10071,6 @@ class HermesCLI:
             self._plan_popup_start_entry("add_task")
             event.app.invalidate()
 
-        @kb.add('r', filter=_plan_popup_browse)
-        def plan_popup_add_review(event):
-            self._plan_popup_start_entry("add_review")
-            event.app.invalidate()
-
         @kb.add('space', filter=_plan_popup_browse)
         def plan_popup_toggle_done(event):
             self._plan_popup_toggle_selected_completed()
@@ -10055,7 +10084,7 @@ class HermesCLI:
         @kb.add('escape', filter=Condition(lambda: bool(self._plan_popup_state)))
         def plan_popup_escape(event):
             state = self._plan_popup_state or {}
-            if state.get("mode") in {"add_task", "add_review"}:
+            if state.get("mode") == "add_task":
                 state["mode"] = "browse"
                 event.app.current_buffer.reset()
                 event.app.invalidate()
@@ -11345,6 +11374,7 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    gateway_session_mode: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -11454,6 +11484,7 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
+        gateway_session_mode=gateway_session_mode,
     )
 
     if parsed_skills:

@@ -333,6 +333,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        from agent.session_host import SessionHost
+        self._session_host = SessionHost()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -453,6 +455,13 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        reasoning_callback=None,
+        tool_gen_callback=None,
+        model_override: Optional[str] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
+        service_tier: Optional[str] = None,
+        context_length_override: Optional[int] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -467,10 +476,25 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        if runtime_overrides:
+            for key in ("provider", "api_key", "base_url", "api_mode"):
+                value = runtime_overrides.get(key)
+                if value not in (None, ""):
+                    runtime_kwargs[key] = value
+        model = model_override or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        explicit_platform_toolsets = None
+        if isinstance(user_config, dict):
+            platform_toolsets = user_config.get("platform_toolsets", {}) or {}
+            if isinstance(platform_toolsets.get("api_server"), list):
+                explicit_platform_toolsets = [str(tool) for tool in platform_toolsets.get("api_server") if str(tool).strip()]
+        if explicit_platform_toolsets is not None:
+            enabled_toolsets = sorted(explicit_platform_toolsets)
+        else:
+            enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if enabled_toolsets_override:
+            enabled_toolsets = sorted(str(tool) for tool in enabled_toolsets_override if str(tool).strip())
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -491,8 +515,12 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            reasoning_callback=reasoning_callback,
+            tool_gen_callback=tool_gen_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            service_tier=service_tier,
+            context_length_override=context_length_override,
         )
         return agent
 
@@ -1403,7 +1431,14 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        reasoning_callback=None,
+        tool_gen_callback=None,
         agent_ref: Optional[list] = None,
+        model_override: Optional[str] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
+        service_tier: Optional[str] = None,
+        context_length_override: Optional[int] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1424,6 +1459,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                reasoning_callback=reasoning_callback,
+                tool_gen_callback=tool_gen_callback,
+                model_override=model_override,
+                runtime_overrides=runtime_overrides,
+                enabled_toolsets_override=enabled_toolsets_override,
+                service_tier=service_tier,
+                context_length_override=context_length_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -1490,13 +1532,13 @@ class APIServerAdapter(BasePlatformAdapter):
         return _callback
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs — start an agent run, return run_id immediately."""
+        """POST /v1/runs — start a hosted session run and return its run_id."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
+        self._session_host.purge_finished_runs(older_than_seconds=self._RUN_STREAM_TTL)
+        if self._session_host.active_run_count() >= self._MAX_CONCURRENT_RUNS:
             return web.json_response(
                 _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
                 status=429,
@@ -1515,33 +1557,26 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = time.time()
-
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        # Also wire stream_delta_callback so message.delta events flow through
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
-
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        runtime_overrides = {
+            "provider": body.get("provider"),
+            "api_key": body.get("api_key"),
+            "base_url": body.get("base_url"),
+            "api_mode": body.get("api_mode"),
+        }
+        model_override = body.get("model")
+        toolsets_override = body.get("toolsets")
+        if toolsets_override is not None and not isinstance(toolsets_override, list):
+            return web.json_response(_openai_error("'toolsets' must be an array when provided"), status=400)
+        service_tier = body.get("service_tier")
+        context_length_override = body.get("context_length_override")
+        if context_length_override is not None:
+            try:
+                context_length_override = int(context_length_override)
+            except (TypeError, ValueError):
+                return web.json_response(_openai_error("'context_length_override' must be an integer"), status=400)
 
-        # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
@@ -1567,99 +1602,73 @@ class APIServerAdapter(BasePlatformAdapter):
                 if instructions is None:
                     instructions = stored.get("instructions")
 
-        # When input is a multi-message array, extract all but the last
-        # message as conversation history (the last becomes user_message).
-        # Only fires when no explicit history was provided.
         if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
             for msg in raw_input[:-1]:
                 if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                     content = msg["content"]
                     if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
                         content = " ".join(
                             part.get("text", "") for part in content
                             if isinstance(part, dict) and part.get("type") == "text"
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or run_id
-        ephemeral_system_prompt = instructions
+        session_id = body.get("session_id") or f"sess_{uuid.uuid4().hex}"
+        run_id = f"run_{uuid.uuid4().hex}"
 
-        async def _run_and_close():
-            try:
-                agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
-                )
-                def _run_sync():
-                    r = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id="default",
-                    )
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+        async def _run_hosted(**callbacks):
+            agent_ref = callbacks.get("agent_ref")
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=instructions,
+                session_id=session_id,
+                stream_delta_callback=callbacks.get("stream_delta_callback"),
+                tool_progress_callback=callbacks.get("tool_progress_callback"),
+                reasoning_callback=callbacks.get("reasoning_callback"),
+                tool_gen_callback=callbacks.get("tool_gen_callback"),
+                agent_ref=agent_ref,
+                model_override=model_override,
+                runtime_overrides=runtime_overrides,
+                enabled_toolsets_override=toolsets_override,
+                service_tier=service_tier,
+                context_length_override=context_length_override,
+            )
+            return result, usage, agent_ref[0] if agent_ref else None
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
-                    "event": "run.completed",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "output": final_response,
-                    "usage": usage,
-                })
-            except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
-                try:
-                    q.put_nowait({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": str(exc),
-                    })
-                except Exception:
-                    pass
-            finally:
-                # Sentinel: signal SSE stream to close
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
-
-        task = asyncio.create_task(_run_and_close())
         try:
-            self._background_tasks.add(task)
-        except TypeError:
-            pass
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
+            await self._session_host.start_run(
+                session_id=session_id,
+                user_message=user_message,
+                conversation_history=conversation_history,
+                instructions=instructions,
+                run_callable=_run_hosted,
+                metadata={
+                    "model": model_override or self._model_name,
+                    "provider": runtime_overrides.get("provider") or None,
+                },
+                run_id=run_id,
+            )
+        except RuntimeError as exc:
+            return web.json_response(_openai_error(str(exc), code="session_busy"), status=409)
+        except Exception as exc:
+            logger.exception("[api_server] could not start run %s", run_id)
+            return web.json_response(_openai_error(f"Internal server error: {exc}", err_type="server_error"), status=500)
 
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+        return web.json_response({"run_id": run_id, "session_id": session_id, "status": "started"}, status=202)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """GET /v1/runs/{run_id}/events — SSE stream of canonical hosted-run events."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
-
-        # Allow subscribing slightly before the run is registered (race condition window)
-        for _ in range(20):
-            if run_id in self._run_streams:
-                break
-            await asyncio.sleep(0.05)
-        else:
+        run = self._session_host.get_run(run_id)
+        if run is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        q = self._session_host.subscribe_run(run_id, loop=asyncio.get_running_loop())
 
         response = web.StreamResponse(
             status=200,
@@ -1679,33 +1688,42 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
-                    # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
                 payload = f"data: {json.dumps(event)}\n\n"
                 await response.write(payload.encode())
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
-        finally:
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
 
         return response
 
+    async def _handle_cancel_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/cancel — interrupt an active hosted run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        if not self._session_host.cancel_run(run_id, reason="Cancelled by client"):
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        return web.json_response({"ok": True, "run_id": run_id})
+
+    async def _handle_close_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/close — close a hosted session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        if not self._session_host.close_session(session_id):
+            return web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+        return web.json_response({"ok": True, "session_id": session_id})
+
     async def _sweep_orphaned_runs(self) -> None:
-        """Periodically clean up run streams that were never consumed."""
+        """Periodically clean up finished hosted runs after a short TTL."""
         while True:
             await asyncio.sleep(60)
-            now = time.time()
-            stale = [
-                run_id
-                for run_id, created_at in list(self._run_streams_created.items())
-                if now - created_at > self._RUN_STREAM_TTL
-            ]
-            for run_id in stale:
-                logger.debug("[api_server] sweeping orphaned run %s", run_id)
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
+            removed = self._session_host.purge_finished_runs(older_than_seconds=self._RUN_STREAM_TTL)
+            if removed:
+                logger.debug("[api_server] swept %d finished hosted run(s)", removed)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -1737,10 +1755,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
-            # Structured event streaming
+            # Structured hosted-session event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
-            # Start background sweep to clean up orphaned (unconsumed) run streams
+            self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
+            self._app.router.add_post("/v1/sessions/{session_id}/close", self._handle_close_session)
+            # Start background sweep to clean up old finished runs
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
                 self._background_tasks.add(sweep_task)

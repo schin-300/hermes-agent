@@ -1,0 +1,27 @@
+{
+  "id": "basic_tool_run",
+  "description": "One hosted session run with a single tool call, streamed text, and normal completion.",
+  "current_bridge_events": [
+    "tool.started",
+    "tool.completed",
+    "reasoning.available",
+    "message.delta",
+    "run.completed",
+    "run.failed",
+    "run.cancelled"
+  ],
+  "missing_from_current_bridge": [
+    "run.started",
+    "tool.generating",
+    "message.completed"
+  ],
+  "target_events": [
+    "run.started",
+    "tool.generating",
+    "tool.started",
+    "tool.completed",
+    "message.delta",
+    "message.completed",
+    "run.completed"
+  ]
+}

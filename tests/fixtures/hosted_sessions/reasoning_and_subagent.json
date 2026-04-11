@@ -1,0 +1,30 @@
+{
+  "id": "reasoning_and_subagent",
+  "description": "Hosted session run that includes reasoning activity and child/subagent progress before completion.",
+  "current_bridge_events": [
+    "tool.started",
+    "tool.completed",
+    "reasoning.available",
+    "message.delta",
+    "run.completed",
+    "run.failed",
+    "run.cancelled"
+  ],
+  "missing_from_current_bridge": [
+    "_thinking",
+    "subagent.progress",
+    "reasoning.delta",
+    "reasoning.completed"
+  ],
+  "target_events": [
+    "run.started",
+    "reasoning.delta",
+    "reasoning.completed",
+    "tool.started",
+    "tool.completed",
+    "subagent.progress",
+    "message.delta",
+    "message.completed",
+    "run.completed"
+  ]
+}

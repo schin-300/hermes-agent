@@ -586,8 +586,16 @@ def cmd_chat(args):
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
 
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
+    gateway_session_mode = (
+        not getattr(args, "query", None)
+        and sys.stdin.isatty()
+        and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
+    # First-run guard: interactive hosted sessions use the gateway runtime,
+    # so they do not require a locally configured provider.
+    if not gateway_session_mode and not _has_any_provider_configured():
         print()
         print("It looks like Hermes isn't configured yet -- no API keys or providers found.")
         print()
@@ -653,6 +661,7 @@ def cmd_chat(args):
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
+        "gateway_session_mode": gateway_session_mode,
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
