@@ -643,6 +643,20 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    hosted_tmux_mode = (
+        gateway_session_mode
+        and str(os.getenv("HERMES_HOSTED_TMUX_MODE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    )
+    if hosted_tmux_mode:
+        from hermes_cli.hosted_session_client import HostedSessionClientError
+        from hermes_cli.hosted_tmux_client import HostedTmuxAttachError, run_hosted_tmux_chat
+        try:
+            run_hosted_tmux_chat(args)
+            return
+        except (HostedTmuxAttachError, HostedSessionClientError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
     # Import and run the CLI
     from cli import main as cli_main
     

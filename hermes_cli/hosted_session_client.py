@@ -253,6 +253,17 @@ class HostedSessionAgentProxy:
             return []
         return [dict(row) for row in rows if isinstance(row, dict) and row.get("id")]
 
+    def get_session_state(self, session_id: Optional[str] = None) -> dict[str, Any]:
+        target_id = str(session_id or self.session_id)
+        response = self.http_session.get(
+            f"{self.endpoint.base_url}/v1/sessions/{target_id}",
+            headers=self._headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return dict(payload) if isinstance(payload, dict) else {}
+
     def switch_session(self, new_session_id: str) -> None:
         target_id = str(new_session_id or "").strip()
         if not target_id or target_id == self.session_id:

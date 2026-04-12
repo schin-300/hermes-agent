@@ -334,7 +334,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         from agent.session_host import SessionHost
+        from gateway.hosted_tmux import HostedTmuxManager
         self._session_host = SessionHost()
+        self._hosted_tmux = HostedTmuxManager()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1578,6 +1580,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("'context_length_override' must be an integer"), status=400)
 
         conversation_history: List[Dict[str, str]] = []
+        client_seeded_history = False
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -1592,6 +1595,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         status=400,
                     )
                 conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+            client_seeded_history = True
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -1599,6 +1603,7 @@ class APIServerAdapter(BasePlatformAdapter):
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
+                client_seeded_history = True
                 if instructions is None:
                     instructions = stored.get("instructions")
 
@@ -1612,15 +1617,23 @@ class APIServerAdapter(BasePlatformAdapter):
                             if isinstance(part, dict) and part.get("type") == "text"
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
+            client_seeded_history = bool(conversation_history)
 
         session_id = body.get("session_id") or f"sess_{uuid.uuid4().hex}"
+        existing_session = self._session_host.get_session(session_id)
+        session_history = existing_session.conversation_history if existing_session else []
+        effective_history = conversation_history if client_seeded_history else [
+            {"role": str(msg.get("role", "")), "content": str(msg.get("content", ""))}
+            for msg in session_history
+            if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}
+        ]
         run_id = f"run_{uuid.uuid4().hex}"
 
         async def _run_hosted(**callbacks):
             agent_ref = callbacks.get("agent_ref")
             result, usage = await self._run_agent(
                 user_message=user_message,
-                conversation_history=conversation_history,
+                conversation_history=effective_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=callbacks.get("stream_delta_callback"),
@@ -1640,7 +1653,7 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._session_host.start_run(
                 session_id=session_id,
                 user_message=user_message,
-                conversation_history=conversation_history,
+                conversation_history=effective_history,
                 instructions=instructions,
                 run_callable=_run_hosted,
                 metadata={
@@ -1721,6 +1734,84 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error("'limit' must be an integer"), status=400)
         sessions = self._session_host.list_sessions(live_only=True, limit=limit)
         return web.json_response({"sessions": sessions})
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — fetch the gateway-owned session snapshot/history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        snapshot = self._session_host.get_session_snapshot(session_id)
+        if snapshot is None:
+            return web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+        return web.json_response(snapshot)
+
+    async def _handle_ensure_terminal_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/terminal-sessions/ensure — create or find a real tmux-backed Hermes session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        toolsets = (body or {}).get("toolsets")
+        if isinstance(toolsets, str):
+            toolsets = [part.strip() for part in toolsets.split(",") if part.strip()]
+        if toolsets is not None and not isinstance(toolsets, list):
+            return web.json_response(_openai_error("'toolsets' must be an array when provided"), status=400)
+        skills = (body or {}).get("skills")
+        if isinstance(skills, str):
+            skills = [part.strip() for part in skills.split(",") if part.strip()]
+        if skills is not None and not isinstance(skills, list):
+            return web.json_response(_openai_error("'skills' must be an array when provided"), status=400)
+        try:
+            session = self._hosted_tmux.ensure_session(
+                requested_session_id=(body or {}).get("session_id"),
+                model=(body or {}).get("model"),
+                provider=(body or {}).get("provider"),
+                toolsets=toolsets,
+                skills=skills,
+                pass_session_id=bool((body or {}).get("pass_session_id", False)),
+                max_turns=(body or {}).get("max_turns"),
+                checkpoints=bool((body or {}).get("checkpoints", False)),
+            )
+        except RuntimeError as exc:
+            return web.json_response(_openai_error(str(exc), code="terminal_session_error"), status=404)
+        except Exception as exc:
+            logger.exception("[api_server] could not ensure hosted terminal session")
+            return web.json_response(_openai_error(f"Internal server error: {exc}", err_type="server_error"), status=500)
+        return web.json_response({
+            "session_id": session.session_id,
+            "tmux_target": session.tmux_target,
+            "socket_path": session.socket_path,
+            "created": session.created,
+        })
+
+    async def _handle_list_terminal_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/terminal-sessions — list tmux-backed hosted Hermes sessions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        raw_limit = request.query.get("limit")
+        limit = 50
+        if raw_limit not in (None, ""):
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return web.json_response(_openai_error("'limit' must be an integer"), status=400)
+        sessions = [session.__dict__ for session in self._hosted_tmux.list_sessions(limit=limit)]
+        return web.json_response({"sessions": sessions})
+
+    async def _handle_close_terminal_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/terminal-sessions/{session_id}/close — kill a tmux-backed hosted Hermes session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        if not self._hosted_tmux.close_session(session_id):
+            return web.json_response(_openai_error(f"Terminal session not found: {session_id}", code="session_not_found"), status=404)
+        return web.json_response({"ok": True, "session_id": session_id})
 
     async def _handle_attach_session(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/attach — register a live client attachment for a hosted session."""
@@ -1813,9 +1904,13 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
             self._app.router.add_get("/v1/sessions/live", self._handle_live_sessions)
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_post("/v1/sessions/{session_id}/attach", self._handle_attach_session)
             self._app.router.add_post("/v1/sessions/{session_id}/detach", self._handle_detach_session)
             self._app.router.add_post("/v1/sessions/{session_id}/close", self._handle_close_session)
+            self._app.router.add_post("/v1/terminal-sessions/ensure", self._handle_ensure_terminal_session)
+            self._app.router.add_get("/v1/terminal-sessions", self._handle_list_terminal_sessions)
+            self._app.router.add_post("/v1/terminal-sessions/{session_id}/close", self._handle_close_terminal_session)
             # Start background sweep to clean up old finished runs
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

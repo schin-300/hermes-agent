@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,9 +23,13 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/cancel", adapter._handle_cancel_run)
     app.router.add_get("/v1/sessions/live", adapter._handle_live_sessions)
+    app.router.add_get("/v1/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_post("/v1/sessions/{session_id}/attach", adapter._handle_attach_session)
     app.router.add_post("/v1/sessions/{session_id}/detach", adapter._handle_detach_session)
     app.router.add_post("/v1/sessions/{session_id}/close", adapter._handle_close_session)
+    app.router.add_post("/v1/terminal-sessions/ensure", adapter._handle_ensure_terminal_session)
+    app.router.add_get("/v1/terminal-sessions", adapter._handle_list_terminal_sessions)
+    app.router.add_post("/v1/terminal-sessions/{session_id}/close", adapter._handle_close_terminal_session)
     return app
 
 
@@ -195,3 +200,45 @@ async def test_live_session_endpoints_keep_detached_sessions_visible_until_close
 
         live_closed = await cli.get("/v1/sessions/live")
         assert (await live_closed.json())["sessions"] == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_session_endpoints_create_list_and_close_tmux_sessions():
+    adapter = _make_adapter()
+    app = _create_app(adapter)
+    adapter._hosted_tmux.ensure_session = lambda **kwargs: SimpleNamespace(
+        session_id=kwargs.get("requested_session_id") or "sess_tmux",
+        tmux_target="hermes-hosted-sess_tmux",
+        socket_path="/tmp/hermes.sock",
+        created=True,
+    )
+    adapter._hosted_tmux.list_sessions = lambda limit=50: [
+        SimpleNamespace(
+            session_id="sess_tmux",
+            tmux_target="hermes-hosted-sess_tmux",
+            socket_path="/tmp/hermes.sock",
+            created=False,
+            status="running",
+            title="Hosted session",
+            preview="ready",
+            attached_clients=0,
+            last_active=1.0,
+        )
+    ]
+    adapter._hosted_tmux.close_session = lambda session_id: session_id == "sess_tmux"
+
+    async with TestClient(TestServer(app)) as cli:
+        ensure = await cli.post("/v1/terminal-sessions/ensure", json={"session_id": "sess_tmux", "toolsets": ["core"]})
+        assert ensure.status == 200
+        ensure_payload = await ensure.json()
+        assert ensure_payload["session_id"] == "sess_tmux"
+        assert ensure_payload["tmux_target"] == "hermes-hosted-sess_tmux"
+
+        listed = await cli.get("/v1/terminal-sessions?limit=10")
+        assert listed.status == 200
+        rows = (await listed.json())["sessions"]
+        assert [row["session_id"] for row in rows] == ["sess_tmux"]
+
+        close = await cli.post("/v1/terminal-sessions/sess_tmux/close")
+        assert close.status == 200
+        assert (await close.json())["ok"] is True

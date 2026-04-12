@@ -187,6 +187,32 @@ class SessionHost:
             rows = rows[:limit]
         return rows
 
+    def get_session_snapshot(self, session_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.closed:
+                return None
+            summary = self._session_summary_locked(session)
+            active_run = self._runs.get(session.active_run_id) if session.active_run_id else None
+            run_payload = None
+            if active_run is not None:
+                run_payload = {
+                    "run_id": active_run.run_id,
+                    "status": active_run.status,
+                    "finished": active_run.finished,
+                    "cancel_requested": active_run.cancel_requested,
+                    "error": active_run.error,
+                    "final_response": active_run.final_response,
+                    "usage": dict(active_run.usage or {}),
+                }
+            return {
+                **summary,
+                "conversation_history": [dict(msg) for msg in session.conversation_history if isinstance(msg, dict)],
+                "active_run": run_payload,
+                "attachments": [dict(info) for info in session.attachments.values()],
+                "metadata": dict(session.metadata or {}),
+            }
+
     def active_run_count(self) -> int:
         with self._lock:
             return sum(1 for run in self._runs.values() if not run.finished)

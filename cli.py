@@ -1909,9 +1909,12 @@ class HermesCLI:
         self._pending_title: Optional[str] = None
         
         # Session ID: reuse existing one when resuming, otherwise generate fresh
+        _forced_session_id = str(os.getenv("HERMES_FORCED_SESSION_ID", "")).strip()
         if resume:
             self.session_id = resume
             self._resumed = True
+        elif _forced_session_id:
+            self.session_id = _forced_session_id
         else:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
@@ -5210,11 +5213,91 @@ class HermesCLI:
         print()
         return True
 
+    def _hosted_tmux_child_mode(self) -> bool:
+        return str(os.getenv("HERMES_HOSTED_TMUX_CHILD", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _list_hosted_tmux_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        from gateway.hosted_tmux import HostedTmuxManager
+
+        manager = HostedTmuxManager()
+        sessions: list[dict[str, Any]] = []
+        for session in manager.list_sessions(limit=limit):
+            sessions.append(
+                {
+                    "id": session.session_id,
+                    "title": session.title or session.session_id,
+                    "preview": session.preview,
+                    "source": "hosted_tmux",
+                    "last_active": session.last_active,
+                    "status": session.status,
+                    "attached_clients": session.attached_clients,
+                }
+            )
+        return sessions
+
+    def _switch_hosted_tmux_session(self, target_session_id: str, *, create_if_missing: bool = True) -> bool:
+        from gateway.hosted_tmux import HostedTmuxManager
+
+        manager = HostedTmuxManager()
+        try:
+            session = manager.describe_session(target_session_id)
+            if session is None and create_if_missing:
+                session = manager.ensure_session(
+                    requested_session_id=target_session_id,
+                    model=self.model,
+                    provider=self.provider,
+                    toolsets=list(self.enabled_toolsets or []),
+                    pass_session_id=self.pass_session_id,
+                    max_turns=self.max_turns,
+                    checkpoints=self.checkpoints_enabled,
+                )
+            if session is None:
+                _cprint(f"  Hosted session not found: {target_session_id}")
+                return False
+            subprocess.run(
+                ["tmux", "-S", str(manager.socket_path), "switch-client", "-t", session.tmux_target],
+                check=True,
+            )
+            manager.mark_current_session(session.session_id)
+            return True
+        except Exception as e:
+            _cprint(f"  Could not switch hosted session: {e}")
+            return False
+
+    def _spawn_new_hosted_tmux_session(self) -> bool:
+        from gateway.hosted_tmux import HostedTmuxManager
+
+        manager = HostedTmuxManager()
+        try:
+            session = manager.ensure_session(
+                model=self.model,
+                provider=self.provider,
+                toolsets=list(self.enabled_toolsets or []),
+                pass_session_id=self.pass_session_id,
+                max_turns=self.max_turns,
+                checkpoints=self.checkpoints_enabled,
+                prefer_current=False,
+            )
+            subprocess.run(
+                ["tmux", "-S", str(manager.socket_path), "switch-client", "-t", session.tmux_target],
+                check=True,
+            )
+            manager.mark_current_session(session.session_id)
+            return True
+        except Exception as e:
+            _cprint(f"  Could not create hosted session: {e}")
+            return False
+
     def _list_switchable_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return sessions suitable for barebones Ctrl+B session switching."""
         gateway_mode = getattr(self, "gateway_session_mode", False)
         sessions: list[dict[str, Any]] = []
-        if gateway_mode:
+        if self._hosted_tmux_child_mode():
+            try:
+                sessions = self._list_hosted_tmux_sessions(limit=limit)
+            except Exception:
+                sessions = []
+        elif gateway_mode:
             if self.agent is None:
                 try:
                     self._init_agent()
@@ -5235,12 +5318,20 @@ class HermesCLI:
             except Exception:
                 sessions = []
 
+        current_id = self.session_id
+        if self._hosted_tmux_child_mode():
+            try:
+                from gateway.hosted_tmux import HostedTmuxManager
+
+                current_id = HostedTmuxManager().current_session_id() or current_id
+            except Exception:
+                pass
         annotated = []
         for session in sessions:
             if not isinstance(session, dict) or not session.get("id"):
                 continue
             row = dict(session)
-            if row["id"] == self.session_id:
+            if row["id"] == current_id:
                 title = (row.get("title") or row.get("preview") or row["id"]).strip()
                 row["title"] = f"● {title}" if title else f"● {row['id']}"
             annotated.append(row)
@@ -5249,12 +5340,15 @@ class HermesCLI:
     def _browse_and_swap_session(self) -> bool:
         """Open the curses session picker and switch this CLI to the selected session."""
         gateway_mode = getattr(self, "gateway_session_mode", False)
+        hosted_tmux_child = self._hosted_tmux_child_mode()
         if self._agent_running:
             _cprint("  Interrupt current work first, then Ctrl+B to switch sessions.")
             return False
         sessions = self._list_switchable_sessions(limit=50)
         if not sessions:
-            if gateway_mode:
+            if hosted_tmux_child:
+                _cprint("  No live hosted sessions available to switch.")
+            elif gateway_mode:
                 _cprint("  No live gateway sessions available to switch.")
             else:
                 _cprint("  No sessions available to switch.")
@@ -5263,9 +5357,19 @@ class HermesCLI:
         selected_id = _session_browse_picker(sessions)
         if not selected_id:
             return False
-        if selected_id == self.session_id:
+        current_id = self.session_id
+        if hosted_tmux_child:
+            try:
+                from gateway.hosted_tmux import HostedTmuxManager
+
+                current_id = HostedTmuxManager().current_session_id() or current_id
+            except Exception:
+                pass
+        if selected_id == current_id:
             _cprint("  Already on that session.")
             return False
+        if hosted_tmux_child:
+            return self._switch_hosted_tmux_session(selected_id)
         self._handle_resume_command(f"/resume {selected_id}")
         return True
 
@@ -7130,9 +7234,25 @@ class HermesCLI:
                 else:
                     _cprint("  Session database not available.")
         elif canonical == "new":
-            self.new_session()
+            if self._hosted_tmux_child_mode():
+                self._spawn_new_hosted_tmux_session()
+            else:
+                self.new_session()
         elif canonical == "resume":
-            self._handle_resume_command(cmd_original)
+            if self._hosted_tmux_child_mode():
+                parts = cmd_original.split(None, 1)
+                target = parts[1].strip() if len(parts) > 1 else ""
+                if not target:
+                    _cprint("  Usage: /resume <session_id_or_title>")
+                    if self._show_recent_sessions(reason="resume"):
+                        return
+                    _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
+                else:
+                    from hermes_cli.main import _resolve_session_by_name_or_id
+                    resolved = _resolve_session_by_name_or_id(target)
+                    self._switch_hosted_tmux_session(resolved or target)
+            else:
+                self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
         elif canonical == "context-limit":

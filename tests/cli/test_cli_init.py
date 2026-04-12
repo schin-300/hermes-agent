@@ -3,6 +3,7 @@ that only manifest at runtime (not in mocked unit tests)."""
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.display import get_tool_emoji
@@ -102,6 +103,11 @@ class TestGatewayHostedMode:
     def test_gateway_session_mode_flag_is_stored(self):
         cli = _make_cli(gateway_session_mode=True)
         assert cli.gateway_session_mode is True
+
+    def test_forced_session_id_env_is_used_for_new_session(self):
+        cli = _make_cli(env_overrides={"HERMES_FORCED_SESSION_ID": "forced_session_123"})
+        assert cli.session_id == "forced_session_123"
+        assert cli._resumed is False
 
     def test_init_agent_uses_hosted_proxy_when_gateway_session_mode_enabled(self):
         from types import SimpleNamespace
@@ -225,6 +231,60 @@ class TestSessionSwitcher:
             globals_dict["_cprint"] = original_cprint
 
         assert any("Interrupt current work first" in msg for msg in printed)
+
+    def test_list_switchable_sessions_uses_live_tmux_sessions_when_hosted_tmux_child(self):
+        cli = _make_cli()
+        cli.session_id = "stale-local"
+        cli._session_db = MagicMock()
+        fake_manager = MagicMock()
+        fake_manager.list_sessions.return_value = [
+            SimpleNamespace(session_id="sess_a", title="Session A", preview="ready", status="running", attached_clients=0, last_active=10.0),
+            SimpleNamespace(session_id="sess_b", title="Session B", preview="idle", status="running", attached_clients=0, last_active=5.0),
+        ]
+        fake_manager.current_session_id.return_value = "sess_a"
+
+        with patch.dict("os.environ", {"HERMES_HOSTED_TMUX_CHILD": "1"}, clear=False), \
+             patch("gateway.hosted_tmux.HostedTmuxManager", return_value=fake_manager):
+            sessions = cli._list_switchable_sessions(limit=12)
+
+        cli._session_db.list_sessions_rich.assert_not_called()
+        assert [row["id"] for row in sessions] == ["sess_a", "sess_b"]
+        assert sessions[0]["title"].startswith("● ")
+
+    def test_browse_and_swap_session_switches_tmux_target_when_hosted_tmux_child(self):
+        cli = _make_cli()
+        cli._agent_running = False
+        cli._switch_hosted_tmux_session = MagicMock(return_value=True)
+        fake_manager = MagicMock()
+        fake_manager.current_session_id.return_value = "sess_a"
+        with patch.dict("os.environ", {"HERMES_HOSTED_TMUX_CHILD": "1"}, clear=False), \
+             patch.object(cli, "_list_hosted_tmux_sessions", return_value=[
+                 {"id": "sess_a", "title": "Session A", "preview": "ready", "source": "hosted_tmux"},
+                 {"id": "sess_b", "title": "Session B", "preview": "idle", "source": "hosted_tmux"},
+             ]), patch("gateway.hosted_tmux.HostedTmuxManager", return_value=fake_manager), \
+             patch("hermes_cli.main._session_browse_picker", return_value="sess_b"):
+            assert cli._browse_and_swap_session() is True
+
+        cli._switch_hosted_tmux_session.assert_called_once_with("sess_b")
+
+    def test_process_command_new_spawns_new_hosted_tmux_session_when_child(self):
+        cli = _make_cli()
+        cli._spawn_new_hosted_tmux_session = MagicMock(return_value=True)
+
+        with patch.dict("os.environ", {"HERMES_HOSTED_TMUX_CHILD": "1"}, clear=False):
+            cli.process_command("/new")
+
+        cli._spawn_new_hosted_tmux_session.assert_called_once_with()
+
+    def test_process_command_resume_switches_tmux_session_when_child(self):
+        cli = _make_cli()
+        cli._switch_hosted_tmux_session = MagicMock(return_value=True)
+
+        with patch.dict("os.environ", {"HERMES_HOSTED_TMUX_CHILD": "1"}, clear=False), \
+             patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_b"):
+            cli.process_command("/resume named session")
+
+        cli._switch_hosted_tmux_session.assert_called_once_with("sess_b")
 
 
 class TestBusyInputMode:
