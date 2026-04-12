@@ -53,11 +53,11 @@ class TodoStore:
         """
         if not merge:
             # Replace mode: new list entirely
-            self._items = [self._validate(t) for t in todos]
+            self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
         else:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
-            for t in todos:
+            for t in self._dedupe_by_id(todos):
                 item_id = str(t.get("id", "")).strip()
                 if not item_id:
                     continue  # Can't merge without an id
@@ -173,6 +173,16 @@ class TodoStore:
                 pass
 
         return clean
+
+
+    @staticmethod
+    def _dedupe_by_id(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collapse duplicate ids, keeping the last occurrence in its position."""
+        last_index: Dict[str, int] = {}
+        for i, item in enumerate(todos):
+            item_id = str(item.get("id", "")).strip() or "?"
+            last_index[item_id] = i
+        return [todos[i] for i in sorted(last_index.values())]
 
 
 def build_todo_snapshot_message(items: List[Dict[str, Any]]) -> str:

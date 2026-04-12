@@ -43,6 +43,18 @@ class TestWriteAndRead:
         assert "reviewer_profile" not in item
         assert item["attempt_count"] == 2
 
+    def test_write_deduplicates_duplicate_ids(self):
+        store = TodoStore()
+        result = store.write([
+            {"id": "1", "content": "First version", "status": "pending"},
+            {"id": "2", "content": "Other task", "status": "pending"},
+            {"id": "1", "content": "Latest version", "status": "in_progress"},
+        ])
+        assert result == [
+            {"id": "2", "content": "Other task", "status": "pending", "kind": "task"},
+            {"id": "1", "content": "Latest version", "status": "in_progress", "kind": "task"},
+        ]
+
 
 class TestHasItems:
     def test_empty_store(self):
